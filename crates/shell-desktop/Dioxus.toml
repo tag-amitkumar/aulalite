@@ -1,0 +1,46 @@
+[application]
+name = "AulaLite"
+default_platform = "desktop"
+out_dir = "dist"
+asset_dir = "../shell-web/public"
+
+[bundle]
+identifier = "guru.elementors.aulalite"
+publisher = "Elementors"
+version = "0.1.0"
+file_version = "0.1.0.0"
+icon = [
+    "../design-system/assets/brand/app-icon-32.png",
+    "../design-system/assets/brand/app-icon-128.png",
+    "../design-system/assets/brand/app-icon-256.png",
+    "../design-system/assets/brand/app-icon.ico",
+    "../design-system/assets/brand/app-icon.icns",
+]
+resources = []
+copyright = "Copyright 2026 Elementors. All rights reserved."
+category = "Education"
+short_description = "Teaching, learning, and live academy operations in one workspace."
+long_description = "AulaLite gives schools, coaching centres, independent teachers, students, and families a polished workspace for courses, schedules, assignments, and academy operations."
+
+[permissions]
+camera = { description = "AulaLite uses the camera for live classes and the pre-join preview." }
+microphone = { description = "AulaLite uses the microphone so you can teach and participate in live classes." }
+
+[deep_links]
+schemes = ["aulalite"]
+hosts = ["aula.elementors.guru"]
+paths = ["/sso/finish", "/lti/landing"]
+
+# Android metadata lives in shell-mobile/Dioxus.toml. Windows is intentionally
+# second in the cross-platform release order.
+[windows]
+identifier = "guru.elementors.aulalite"
+publisher = "Elementors"
+icon_path = "../design-system/assets/brand/app-icon.ico"
+capabilities = ["internetClient"]
+
+[windows.webview_install_mode]
+type = "DownloadBootstrapper"
+silent = true
+
+# iOS metadata lives in shell-mobile/Dioxus.toml.

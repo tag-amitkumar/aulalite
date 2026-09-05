@@ -1,0 +1,132 @@
+# Production overlay for docker-compose.yml. Apply it EXPLICITLY — passing -f
+# means Compose does NOT auto-load the dev docker-compose.override.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# On top of the base file this overlay:
+#   * stops publishing datastore/admin ports on the host (postgres, redis, the
+#     RustFS S3 API + console, and the MediaMTX API/metrics) — they remain
+#     reachable in-cluster by service name but are not bound to the node's
+#     interfaces;
+#   * disables the RustFS web console;
+#   * caps per-container memory and rotates container logs (bounds node disk);
+#   * publishes only MediaMTX's ICE UDP listener; signalling and HLS stay behind
+#     Traefik, while a public additional host makes ICE candidates routable.
+#
+# Provide real secrets (POSTGRES_PASSWORD, AWS_*, MEDIAMTX_AUTH_SHARED_HEADER,
+# JWT_RS256_PRIVATE_KEY_PEM, STRIPE_*, …) via the environment / Dokploy UI; never
+# commit them. The backend refuses to boot in production with default/missing
+# values for the security-critical ones (RLS role, JWT PEM, MediaMTX secret,
+# Stripe keys, and the object-store credentials).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    # Not host-published in prod; the backend connects via `postgres:5432`.
+    ports: !reset []
+    environment:
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?set the password used by the aulalite_app DATABASE_URL role}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    ports: !reset []
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  rustfs:
+    # No host-published S3/console ports; the backend signs requests against
+    # `rustfs:9000` in-cluster. For browser-direct presigned uploads, front the
+    # store with a TLS hostname via the reverse proxy (see ops/README.md).
+    ports: !reset []
+    expose:
+      - "9000"
+    environment:
+      # No browser-facing object-store console in production.
+      RUSTFS_CONSOLE_ENABLE: "false"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  backend:
+    # Dokploy routes the API hostname to backend:8080. No fixed node port is
+    # published; Traefik remains the only public ingress.
+    ports: !reset []
+    environment:
+      # Never inherit the local template's APP_ENV or development bypasses in
+      # the production overlay. Security-sensitive startup checks must run.
+      APP_ENV: production
+      APP_ORIGIN: ${APP_ORIGIN:?set the canonical app origin, e.g. https://aula.elementors.guru}
+      API_ORIGIN: ${API_ORIGIN:?set the canonical API origin, e.g. https://api.aula.elementors.guru}
+      AULALITE_BROWSER_ORIGINS: ${AULALITE_BROWSER_ORIGINS:?set the comma-separated app and admin origins}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:?set the canonical admin origin}
+      AULALITE_SUPER_ADMIN_EMAILS: ${AULALITE_SUPER_ADMIN_EMAILS:?set at least one super-admin email}
+      SELF_SERVICE_SIGNUP_ENABLED: ${SELF_SERVICE_SIGNUP_ENABLED:?set true for public signup or false for invite-only}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:?set an owner-level migration URL}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?set the public HTTPS object-store origin, e.g. https://storage.elementors.guru}
+      S3_INTERNAL_ENDPOINT_URL: http://rustfs:9000
+      AULALITE_RATE_LIMIT: "true"
+      AULALITE_MFA_ENFORCE: "true"
+      SSO_SESSION_SECRET: ${SSO_SESSION_SECRET:?set SSO_SESSION_SECRET (at least 32 characters)}
+      AULALITE_DATA_ENCRYPTION_KEY: ${AULALITE_DATA_ENCRYPTION_KEY:?set a base64-encoded 32-byte data encryption key}
+      AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS: ${AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:?set the transactional email provider key}
+      RESEND_FROM: ${RESEND_FROM:?set a verified transactional sender identity}
+      MEDIAMTX_PUBLIC_WEBRTC_URL: ${MEDIAMTX_PUBLIC_WEBRTC_URL:?set the public HTTPS WebRTC signaling URL}
+      MEDIAMTX_PUBLIC_HLS_URL: ${MEDIAMTX_PUBLIC_HLS_URL:?set the public HTTPS HLS URL}
+      LOCAL_LOGIN_BYPASS_ENABLED: "false"
+      LOCAL_AUDIT_SEED_ENABLED: "false"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  frontend:
+    # Dokploy attaches Traefik to this container. Keep the port discoverable
+    # without binding a fixed node port or allowing direct HTTP/TLS bypass.
+    ports: !reset []
+    expose:
+      - "3000"
+    environment:
+      AULALITE_API_BASE_URL: ${AULALITE_API_BASE_URL:?set the public API origin}
+      AULALITE_APP_ORIGIN: ${AULALITE_APP_ORIGIN:?set the public app origin}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:?set the public admin origin}
+      AULALITE_REQUIRE_FIREBASE_CONFIG: "true"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  mediamtx:
+    # Traefik reaches signalling/HLS on 8889/8888. Publish only the UDP ICE
+    # listener on the node. The admin/metrics API (9997/9998) remains private;
+    # MEDIAMTX_AUTH_SHARED_HEADER is visible through the admin config API.
+    ports: !override
+      - "8189:8189/udp"
+    expose:
+      - "8888"
+      - "8889"
+    environment:
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_ADDITIONAL_HOSTS:?set the public deploy-node IP or media DNS hostname used in ICE candidates}
+      MTX_WEBRTCALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:?set the app and admin origins}
+      MTX_HLSALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:?set the app and admin origins}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m

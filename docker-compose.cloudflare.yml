@@ -1,0 +1,87 @@
+# AulaLite — Cloudflare Tunnel overlay.
+#
+# Adds the cloudflared connector and points the app's public-origin
+# variables at the Cloudflare hostnames. Deliberately does NOT touch the
+# base service definitions' ports, so `docker compose up -d` on its own
+# keeps working exactly as before (localhost:3000 / localhost:18080).
+#
+# LOCAL DEV (unchanged, auto-loads docker-compose.override.yml):
+#   docker compose up -d
+#
+# WITH THE TUNNEL (explicit file list; the override is intentionally
+# excluded so host-port remapping is not in play):
+#   docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml \
+#     --env-file .env --env-file ops/cloudflare/tunnel.env up -d
+#
+# The connector joins the same compose network, so it reaches the origins
+# as frontend:3000 / mediamtx:8888 / mediamtx:8889 without any host port
+# being published to the internet.
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # `run` with no tunnel argument uses the tunnel named in config.yml.
+    # --no-autoupdate: an in-place binary swap inside a container is a
+    # silent-restart source; image bumps are the deliberate upgrade path.
+    command: ["tunnel", "--no-autoupdate", "--config", "/etc/cloudflared/config.yml", "run"]
+    volumes:
+      # Mounted read-only: the connector needs its credentials JSON and
+      # rendered config, and must never rewrite them.
+      - ./ops/cloudflare:/etc/cloudflared:ro
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # cloudflared exposes /ready on its metrics listener once at least
+      # one edge connection is established.
+      test: ["CMD-SHELL", "cloudflared --version && wget -q --spider http://127.0.0.1:2000/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  # Public-origin wiring. Everything below is read from
+  # ops/cloudflare/tunnel.env so no hostname is hardcoded in the repo.
+  backend:
+    environment:
+      APP_ORIGIN: ${CF_APP_URL}
+      API_ORIGIN: ${CF_APP_URL}
+      AULALITE_BROWSER_ORIGINS: ${CF_APP_URL}
+      # Presigned S3 URLs embed this host in the signature, so it must be
+      # the origin the BROWSER will use, not the in-cluster rustfs name.
+      S3_ENDPOINT_URL: ${CF_STORAGE_URL:-http://localhost:9000}
+      MEDIAMTX_PUBLIC_WEBRTC_URL: ${CF_WEBRTC_URL}
+      MEDIAMTX_PUBLIC_HLS_URL: ${CF_HLS_URL}
+      STRIPE_SUCCESS_URL: ${CF_APP_URL}/admin/billing?status=success
+      STRIPE_CANCEL_URL: ${CF_APP_URL}/admin/billing?status=cancel
+
+  frontend:
+    environment:
+      # Empty on purpose: the app and API share one hostname, so the
+      # browser calls /v1/* same-origin and no CORS preflight occurs.
+      AULALITE_API_BASE_URL: ""
+      AULALITE_APP_ORIGIN: ${CF_APP_URL}
+
+  mediamtx:
+    environment:
+      # MediaMTX must accept the Cloudflare origin for WebRTC/HLS CORS.
+      MTX_WEBRTCALLOWORIGINS: ${CF_APP_URL}
+      MTX_HLSALLOWORIGINS: ${CF_APP_URL}
+      # ICE candidates advertised to browsers. Loopback is correct only
+      # for same-machine testing; a public deployment needs a routable
+      # address here (see the UDP note in ops/cloudflare/config.yml.template).
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_ADDITIONAL_HOSTS:-127.0.0.1}
+      # A Cloudflare Tunnel forwards TCP only and MediaMTX sits behind the
+      # same NAT as the browser, so its host candidates (loopback / private
+      # LAN) are unreachable from a remote viewer. MediaMTX must therefore
+      # relay its OWN media through the same TURN server the backend hands to
+      # browsers — otherwise relaying the browser alone still finds no path.
+      # This mirrors docker-compose.quicktunnel.yml. Use a SINGLE tunnel-
+      # friendly relay URL here (turns:…:443 or turn:…:443?transport=tcp);
+      # for a turns:+turn: pair, set AULALITE_MEDIAMTX_TURN_URL_1 as well.
+      MTX_WEBRTCICESERVERS2_0_URL: ${AULALITE_MEDIAMTX_TURN_URL:-${AULALITE_TURN_URL}}
+      MTX_WEBRTCICESERVERS2_0_USERNAME: ${AULALITE_TURN_USERNAME}
+      MTX_WEBRTCICESERVERS2_0_PASSWORD: ${AULALITE_TURN_CREDENTIAL}

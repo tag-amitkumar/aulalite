@@ -1,0 +1,90 @@
+# AulaLite — Cloudflare Tunnel ingress (locally-managed tunnel).
+#
+# !! NOT THE FILE THE LIVE DEPLOYMENT USES. !!
+# This template describes an IN-COMPOSE connector, whose origins are Docker
+# service names (`http://frontend:3000`). The actual connector on this host is
+# the Windows service `Cloudflared`, a HOST process that can only reach the
+# stack over published loopback ports. Its config is `config.host.yml` in this
+# directory (installed at C:\ProgramData\cloudflared\config.yml). Editing this
+# template changes nothing that is running.
+#
+# Rendered to ./config.yml by ./render-config.sh, which substitutes the
+# CF_* variables from ops/cloudflare/tunnel.env. Nothing here is a guessed
+# hostname: every value comes from the operator-supplied tunnel.env.
+#
+# WHY A TUNNEL: the Docker host is 192.168.1.2 behind NAT with no public IP,
+# so there is no origin address a proxied Cloudflare A record could target.
+# A named tunnel makes the origin dial out, which needs no inbound firewall
+# rule and no static IP.
+#
+# The connector runs INSIDE the compose network (see
+# docker-compose.cloudflare.yml), so origins are Docker service names, not
+# localhost. Requests never traverse the published host ports, which keeps
+# the existing localhost setup untouched.
+
+tunnel: ${CF_TUNNEL_ID}
+credentials-file: /etc/cloudflared/${CF_TUNNEL_ID}.json
+
+# Cloudflare terminates TLS at the edge; the tunnel leg is an encrypted
+# QUIC/HTTP2 connection to the origin, so plain HTTP inside the compose
+# network is correct here and is not a mixed-content source: the browser
+# only ever speaks HTTPS to the edge.
+originRequest:
+  connectTimeout: 30s
+  # Live-room WebSockets idle for long stretches between messages.
+  # Mirrors the 3600s proxy_read_timeout in the frontend nginx config.
+  noHappyEyeballs: false
+
+ingress:
+  # ---------------------------------------------------------------------
+  # 1. App + API on ONE hostname.
+  #
+  # The frontend nginx already reverse-proxies /v1/* (including the
+  # live-room WebSocket upgrade) to backend:8080. Serving both from a
+  # single hostname makes every API call same-origin, so CORS never
+  # applies and no preflight can fail at the edge. This is why
+  # AULALITE_API_BASE_URL stays empty.
+  # ---------------------------------------------------------------------
+  - hostname: ${CF_APP_HOSTNAME}
+    service: http://frontend:3000
+    originRequest:
+      httpHostHeader: ${CF_APP_HOSTNAME}
+      # Long timeout so /v1/sessions/{id}/socket survives an idle class.
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+
+  # ---------------------------------------------------------------------
+  # 2. HLS playback (watch-only, works fully through the tunnel).
+  #
+  # HLS is plain HTTP segment fetching over TCP, so it traverses
+  # Cloudflare cleanly. This is the reliable public playback path.
+  # ---------------------------------------------------------------------
+  - hostname: ${CF_HLS_HOSTNAME}
+    service: http://mediamtx:8888
+    originRequest:
+      httpHostHeader: ${CF_HLS_HOSTNAME}
+
+  # ---------------------------------------------------------------------
+  # 3. WebRTC WHIP/WHEP *signalling* only.
+  #
+  # READ THIS BEFORE RELYING ON LIVE PUBLISHING:
+  # Only the signalling handshake (an HTTP POST of the SDP offer) crosses
+  # this route. The negotiated media itself is ICE/UDP direct to the
+  # address MediaMTX advertises in webrtcAdditionalHosts, on UDP 8189.
+  # A Cloudflare Tunnel carries HTTP/WebSocket over TCP and does NOT
+  # forward arbitrary UDP, so the SDP exchange will succeed and then no
+  # RTP will ever arrive. Publishing needs ONE of:
+  #   (a) a TURN relay over TCP/TLS 443 — set AULALITE_TURN_URL /
+  #       AULALITE_TURN_USERNAME / AULALITE_TURN_CREDENTIAL, or
+  #   (b) a routable public IP with UDP 8189 port-forwarded and that
+  #       address in MEDIAMTX_ADDITIONAL_HOSTS, or
+  #   (c) Cloudflare Spectrum (Enterprise) for UDP.
+  # Without one of those, use the HLS route above for viewing.
+  # ---------------------------------------------------------------------
+  - hostname: ${CF_WEBRTC_HOSTNAME}
+    service: http://mediamtx:8889
+    originRequest:
+      httpHostHeader: ${CF_WEBRTC_HOSTNAME}
+
+  # Everything else is refused rather than silently served.
+  - service: http_status:404

@@ -1,0 +1,32 @@
+# crates/design-system/Cargo.toml
+[package]
+name = "design-system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dioxus = { workspace = true }
+dioxus-free-icons = { workspace = true }
+pulldown-cmark = { workspace = true }
+kinetics = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "DomRect",
+    "Element",
+    "HtmlElement",
+    "MediaQueryList",
+    "Node",
+    "NodeList",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
+    "Storage",
+] }
+
+[dev-dependencies]
+dioxus-ssr = "=0.7.10"

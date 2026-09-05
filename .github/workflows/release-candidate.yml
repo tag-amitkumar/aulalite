@@ -1,0 +1,362 @@
+name: Ordered release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: SemVer for the candidate (for example 0.1.0-rc.1)
+        required: true
+        type: string
+      through:
+        description: Last platform to build; every earlier platform is a required gate
+        required: true
+        default: web
+        type: choice
+        options:
+          - web
+          - android
+          - windows
+          - ios
+      channel:
+        description: Configuration environment used by native release builds
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ordered-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+  DX_VERSION: "0.7.9"
+
+# This workflow deliberately creates immutable, unsigned release candidates.
+# Publishing, store upload, and code signing remain separate human-approved
+# operations because their credentials must never be committed or embedded in
+# client bundles. The `needs` chain is the product release order: web SaaS,
+# Android, Windows desktop, then iOS.
+jobs:
+  quality:
+    name: 0 · Same-commit quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: rustfmt,clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ordered-release-quality
+      - name: Verify formatting and strict workspace lints
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run service-free workspace tests
+        run: cargo test --workspace --locked
+      - name: Compile the web shell for WebAssembly
+        run: cargo check -p shell-web --target wasm32-unknown-unknown --locked
+
+  web:
+    name: 1 · Web SaaS images
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.release_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate release input and Dioxus lockstep
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$RELEASE_VERSION" =~ $semver ]]; then
+            echo "release_version must be valid SemVer" >&2
+            exit 1
+          fi
+          if (( ${#RELEASE_VERSION} > 120 )); then
+            echo "release_version is too long for release artifact identifiers" >&2
+            exit 1
+          fi
+          workspace_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          candidate_base=$RELEASE_VERSION
+          candidate_base=${candidate_base%%[-+]*}
+          test "$candidate_base" = "$workspace_version" || {
+            echo "release_version base ($candidate_base) must match workspace version ($workspace_version)" >&2
+            exit 1
+          }
+          test "$(dx_version=$(sed -n 's/^dioxus = "=\([^"]*\)"/\1/p' Cargo.toml); printf '%s' "$dx_version")" = "$DX_VERSION"
+          test "$(router_version=$(sed -n 's/^dioxus-router = "=\([^"]*\)"/\1/p' Cargo.toml); printf '%s' "$router_version")" = "$DX_VERSION"
+          # SemVer permits `+build.metadata`; OCI/Docker tags do not permit
+          # `+`, so retain the release name for artifacts and use an explicit,
+          # deterministic tag-safe projection for the two image tags.
+          printf 'OCI_IMAGE_TAG=%s\n' "${RELEASE_VERSION//+/_}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build deployable frontend and backend OCI images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/web
+          docker buildx build \
+            --file crates/shell-web/Dockerfile \
+            --tag "aulalite-web:$OCI_IMAGE_TAG" \
+            --output "type=oci,dest=release/web/aulalite-web.oci.tar" \
+            .
+          docker buildx build \
+            --file crates/backend/Dockerfile \
+            --tag "aulalite-backend:$OCI_IMAGE_TAG" \
+            --output "type=oci,dest=release/web/aulalite-backend.oci.tar" \
+            .
+          sha256sum release/web/*.oci.tar > release/web/SHA256SUMS
+
+      - name: Upload web release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: aulalite-web-${{ inputs.release_version }}
+          path: release/web
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  android:
+    name: 2 · Android candidate
+    if: ${{ inputs.through != 'web' }}
+    needs: web
+    runs-on: ubuntu-latest
+    environment: android-${{ inputs.channel }}
+    env:
+      AULALITE_API_BASE_URL: ${{ vars.AULALITE_API_BASE_URL }}
+      FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
+      FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+      FIREBASE_MESSAGING_SENDER_ID: ${{ vars.FIREBASE_MESSAGING_SENDER_ID }}
+      FIREBASE_ANDROID_APP_ID: ${{ vars.FIREBASE_ANDROID_APP_ID }}
+      ANDROID_NDK_VERSION: "25.2.9519653"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v4
+      - name: Install pinned Android SDK/NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Validate public native configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$FIREBASE_WEB_API_KEY" || { echo "FIREBASE_WEB_API_KEY is required" >&2; exit 1; }
+          test -n "$FIREBASE_PROJECT_ID" || { echo "FIREBASE_PROJECT_ID is required" >&2; exit 1; }
+          test -n "$FIREBASE_MESSAGING_SENDER_ID" || { echo "FIREBASE_MESSAGING_SENDER_ID is required" >&2; exit 1; }
+          test -n "$FIREBASE_ANDROID_APP_ID" || { echo "FIREBASE_ANDROID_APP_ID is required" >&2; exit 1; }
+          case "$FIREBASE_ANDROID_APP_ID" in
+            *:android:*) ;;
+            *) echo "FIREBASE_ANDROID_APP_ID must identify a Firebase Android app" >&2; exit 1 ;;
+          esac
+          python3 - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          value = os.environ.get("AULALITE_API_BASE_URL", "").strip()
+          try:
+              parsed = urlsplit(value)
+              _ = parsed.port
+          except ValueError:
+              parsed = None
+          valid = (
+              parsed is not None
+              and parsed.scheme == "https"
+              and parsed.hostname is not None
+              and parsed.username is None
+              and parsed.password is None
+              and parsed.path in ("", "/")
+              and not parsed.query
+              and not parsed.fragment
+          )
+          if not valid:
+              print("AULALITE_API_BASE_URL must be a bare HTTPS origin", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ordered-release-android
+      - name: Install matching Dioxus CLI
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+      - name: Build unsigned Android app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release/android
+          mkdir -p release/android
+          dx bundle --package shell-mobile --platform android --target aarch64-linux-android --release --package-types aab --locked --out-dir release/android
+          find release/android -type f -name '*.aab' -print -quit | grep -q . || {
+            echo "Dioxus did not produce an Android App Bundle" >&2
+            exit 1
+          }
+          find release/android -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > release/android/SHA256SUMS
+      - name: Upload Android release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: aulalite-android-unsigned-${{ inputs.release_version }}
+          path: release/android
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    name: 3 · Windows desktop candidate
+    if: ${{ inputs.through == 'windows' || inputs.through == 'ios' }}
+    needs: android
+    runs-on: windows-latest
+    environment: windows-${{ inputs.channel }}
+    env:
+      AULALITE_API_BASE_URL: ${{ vars.AULALITE_API_BASE_URL }}
+      FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ordered-release-windows
+      - name: Validate public native configuration
+        shell: pwsh
+        run: |
+          $origin = $null
+          if (-not [Uri]::TryCreate(($env:AULALITE_API_BASE_URL).Trim(), [UriKind]::Absolute, [ref]$origin) `
+              -or $origin.Scheme -ne 'https' `
+              -or [string]::IsNullOrWhiteSpace($origin.Host) `
+              -or -not [string]::IsNullOrEmpty($origin.UserInfo) `
+              -or $origin.AbsolutePath -ne '/' `
+              -or -not [string]::IsNullOrEmpty($origin.Query) `
+              -or -not [string]::IsNullOrEmpty($origin.Fragment)) {
+            throw "AULALITE_API_BASE_URL must be a bare HTTPS origin"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:FIREBASE_WEB_API_KEY)) { throw "FIREBASE_WEB_API_KEY is required" }
+      - name: Install matching Dioxus CLI and NSIS
+        shell: pwsh
+        run: |
+          cargo install dioxus-cli --version $env:DX_VERSION --locked
+          choco install nsis --yes --no-progress
+      - name: Build unsigned Windows installer
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force release\windows -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path release\windows | Out-Null
+          dx bundle --package shell-desktop --platform windows --release --features bundle --package-types nsis --locked --out-dir release\windows
+          if (-not (Get-ChildItem release\windows -Recurse -File -Filter *.exe)) {
+            throw "Dioxus did not produce an NSIS installer"
+          }
+          Get-ChildItem release\windows -Recurse -File | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.FullName.Substring((Resolve-Path release\windows).Path.Length + 1).Replace('\\','/'))"
+          } | Set-Content -Encoding ascii release\windows\SHA256SUMS
+      - name: Upload Windows release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: aulalite-windows-unsigned-${{ inputs.release_version }}
+          path: release/windows
+          if-no-files-found: error
+          retention-days: 30
+
+  ios:
+    name: 4 · iOS simulator candidate
+    if: ${{ inputs.through == 'ios' }}
+    needs: windows
+    runs-on: macos-15
+    environment: ios-${{ inputs.channel }}
+    env:
+      AULALITE_API_BASE_URL: ${{ vars.AULALITE_API_BASE_URL }}
+      FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ordered-release-ios
+      - name: Validate public native configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$FIREBASE_WEB_API_KEY" || { echo "FIREBASE_WEB_API_KEY is required" >&2; exit 1; }
+          python3 - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          value = os.environ.get("AULALITE_API_BASE_URL", "").strip()
+          try:
+              parsed = urlsplit(value)
+              _ = parsed.port
+          except ValueError:
+              parsed = None
+          valid = (
+              parsed is not None
+              and parsed.scheme == "https"
+              and parsed.hostname is not None
+              and parsed.username is None
+              and parsed.password is None
+              and parsed.path in ("", "/")
+              and not parsed.query
+              and not parsed.fragment
+          )
+          if not valid:
+              print("AULALITE_API_BASE_URL must be a bare HTTPS origin", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+      - name: Install matching Dioxus CLI
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+      - name: Build unsigned iOS simulator application
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release/ios
+          mkdir -p release/ios
+          dx bundle --package shell-mobile --platform ios --target aarch64-apple-ios-sim --release --package-types ios --locked --out-dir release/ios/app
+          app_path=$(find release/ios/app -type d -name '*.app' -print -quit)
+          test -n "$app_path" || { echo "Dioxus did not produce an iOS application bundle" >&2; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" release/ios/AulaLite-iOS-simulator.zip
+          rm -rf release/ios/app
+          shasum -a 256 release/ios/AulaLite-iOS-simulator.zip > release/ios/SHA256SUMS
+      - name: Upload iOS simulator candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: aulalite-ios-simulator-unsigned-${{ inputs.release_version }}
+          path: release/ios
+          if-no-files-found: error
+          retention-days: 30

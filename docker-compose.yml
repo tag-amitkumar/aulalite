@@ -1,0 +1,314 @@
+name: ${COMPOSE_PROJECT_NAME:-aulalite}
+
+services:
+  postgres:
+    # The custom image bakes the fresh-cluster runtime-role bootstrap into the
+    # image. Repository bind mounts are deliberately avoided because Dokploy
+    # replaces its Git checkout on every push deployment.
+    build:
+      context: .
+      dockerfile: ops/postgres/Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Used only by docker-entrypoint-initdb.d on a brand-new pg_data volume.
+      # Production requires an explicit value in docker-compose.dokploy.yml.
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-local-runtime-change-me}
+    ports:
+      - "55432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rustfs:
+    # S3-compatible object store (drop-in MinIO replacement, https://rustfs.com).
+    # Pinned by digest (was floating on :latest) so dev and prod run the same
+    # known-good image and an upstream push can't silently change behaviour. Bump
+    # deliberately (re-resolve with `docker buildx imagetools inspect rustfs/rustfs:latest`).
+    image: rustfs/rustfs:latest@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
+    restart: unless-stopped
+    environment:
+      # RustFS server root credentials. These MUST equal the AWS_ACCESS_KEY_ID /
+      # AWS_SECRET_ACCESS_KEY the backend signs S3 requests with (see the backend
+      # service below), so we source them from the same values to remove any
+      # chance of credential drift between the store and its only client.
+      RUSTFS_ACCESS_KEY: ${AWS_ACCESS_KEY_ID}
+      RUSTFS_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY}
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # Named volume: RustFS runs as the non-root user UID 10001, and a named
+      # volume sidesteps the `chown -R 10001:10001` a host bind mount would need.
+      - rustfs_data:/data
+    healthcheck:
+      # Observability only. The backend depends on this service with
+      # `service_started` and retries `ensure_bucket` in-process (see
+      # crates/backend/src/main.rs), so even if curl/wget is absent from the
+      # image this healthcheck can never deadlock backend startup.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || wget -qO- http://127.0.0.1:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backend:
+    build:
+      context: .
+      dockerfile: crates/backend/Dockerfile
+    restart: unless-stopped
+    # Run a tini-equivalent PID 1 so SIGTERM is forwarded to the backend and
+    # zombie ffmpeg remux children are reaped (pairs with the graceful-shutdown
+    # handler in crates/backend/src/main.rs).
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      # Schema changes use an owner-level connection; request traffic uses the
+      # least-privileged DATABASE_URL role. Production requires both.
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
+      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-20}
+      DB_MIN_CONNECTIONS: ${DB_MIN_CONNECTIONS:-0}
+      DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-10}
+      DB_IDLE_TIMEOUT_SECS: ${DB_IDLE_TIMEOUT_SECS:-600}
+      DB_MAX_LIFETIME_SECS: ${DB_MAX_LIFETIME_SECS:-1800}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # Public host used in browser-facing presigned URLs, plus an in-cluster
+      # endpoint for bucket bootstrap and server-side object operations.
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://localhost:9000}
+      S3_INTERNAL_ENDPOINT_URL: ${S3_INTERNAL_ENDPOINT_URL:-http://rustfs:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-aulalite}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      APP_ENV: ${APP_ENV:-local}
+      SELF_SERVICE_SIGNUP_ENABLED: ${SELF_SERVICE_SIGNUP_ENABLED:-true}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID}
+      FIREBASE_JWKS_URL: ${FIREBASE_JWKS_URL}
+      FIREBASE_TOKEN_ISSUER: ${FIREBASE_TOKEN_ISSUER}
+      FIREBASE_WEB_API_KEY: ${FIREBASE_WEB_API_KEY}
+      FIREBASE_AUTH_DOMAIN: ${FIREBASE_AUTH_DOMAIN}
+      APP_ORIGIN: ${APP_ORIGIN}
+      API_ORIGIN: ${API_ORIGIN:-${APP_ORIGIN}}
+      AULALITE_BROWSER_ORIGINS: ${AULALITE_BROWSER_ORIGINS:-${APP_ORIGIN}}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:-}
+      AULALITE_SUPER_ADMIN_EMAILS: ${AULALITE_SUPER_ADMIN_EMAILS:-}
+      LOCAL_LOGIN_BYPASS_ENABLED: ${LOCAL_LOGIN_BYPASS_ENABLED:-false}
+      LOCAL_LOGIN_TOKEN: ${LOCAL_LOGIN_TOKEN:-}
+      LOCAL_LOGIN_TEACHER_TOKEN: ${LOCAL_LOGIN_TEACHER_TOKEN:-}
+      LOCAL_LOGIN_EMAIL: ${LOCAL_LOGIN_EMAIL:-local.teacher@example.test}
+      LOCAL_LOGIN_DISPLAY_NAME: ${LOCAL_LOGIN_DISPLAY_NAME:-Local Teacher}
+      LOCAL_LOGIN_FIREBASE_UID: ${LOCAL_LOGIN_FIREBASE_UID:-local-login-local-teacher}
+      LOCAL_LOGIN_STUDENT_TOKEN: ${LOCAL_LOGIN_STUDENT_TOKEN:-}
+      LOCAL_LOGIN_STUDENT_EMAIL: ${LOCAL_LOGIN_STUDENT_EMAIL:-local.student@example.test}
+      LOCAL_LOGIN_STUDENT_DISPLAY_NAME: ${LOCAL_LOGIN_STUDENT_DISPLAY_NAME:-Local Student}
+      LOCAL_LOGIN_STUDENT_FIREBASE_UID: ${LOCAL_LOGIN_STUDENT_FIREBASE_UID:-local-login-local-student}
+      LOCAL_LOGIN_TEACHER_PASSWORD: ${LOCAL_LOGIN_TEACHER_PASSWORD:-}
+      LOCAL_LOGIN_STUDENT_PASSWORD: ${LOCAL_LOGIN_STUDENT_PASSWORD:-}
+      # Extra dev-only local-login users as a JSON array. See
+      # crates/backend/src/auth/local_login.rs; ignored when APP_ENV=production.
+      LOCAL_LOGIN_EXTRA_PROFILES: ${LOCAL_LOGIN_EXTRA_PROFILES:-}
+      LOCAL_AUDIT_SEED_ENABLED: ${LOCAL_AUDIT_SEED_ENABLED:-false}
+      JWT_RS256_PRIVATE_KEY_PEM: ${JWT_RS256_PRIVATE_KEY_PEM:-}
+      MEDIAMTX_HTTP_URL: ${MEDIAMTX_HTTP_URL:-http://mediamtx:9997}
+      MEDIAMTX_PUBLIC_WEBRTC_URL: ${MEDIAMTX_PUBLIC_WEBRTC_URL:-http://localhost:8889}
+      MEDIAMTX_PUBLIC_HLS_URL: ${MEDIAMTX_PUBLIC_HLS_URL:-http://localhost:8888}
+      # Shared secret required on MediaMTX → backend auth callback. The
+      # backend rejects calls that don't present this via the
+      # `X-MediaMTX-Auth-Shared` header or `?shared=` query parameter. Set
+      # to anything other than the well-known default in production.
+      MEDIAMTX_AUTH_SHARED_HEADER: ${MEDIAMTX_AUTH_SHARED_HEADER:-changeme-mediamtx-auth-shared-secret}
+      AULALITE_TURN_URL: ${AULALITE_TURN_URL:-}
+      AULALITE_TURN_USERNAME: ${AULALITE_TURN_USERNAME:-}
+      AULALITE_TURN_CREDENTIAL: ${AULALITE_TURN_CREDENTIAL:-}
+      RECORDINGS_DIR: ${RECORDINGS_DIR:-/recordings}
+      LIVE_ROOM_CHAT_RETENTION_DAYS: ${LIVE_ROOM_CHAT_RETENTION_DAYS:-90}
+      LIVE_ROOM_RECORDING_RETENTION_DAYS: ${LIVE_ROOM_RECORDING_RETENTION_DAYS:-365}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_SUCCESS_URL: "${STRIPE_SUCCESS_URL:-${APP_ORIGIN:-http://localhost:3000}/admin/billing?status=success}"
+      STRIPE_CANCEL_URL: "${STRIPE_CANCEL_URL:-${APP_ORIGIN:-http://localhost:3000}/admin/billing?status=cancel}"
+      STRIPE_PRICE_ID_STARTER: ${STRIPE_PRICE_ID_STARTER:-}
+      STRIPE_PRICE_ID_PRO: ${STRIPE_PRICE_ID_PRO:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM: "${RESEND_FROM:-AulaLite <notifications@aulalite.app>}"
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID:-}
+      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
+      FCM_SERVICE_ACCOUNT_JSON_PATH: ${FCM_SERVICE_ACCOUNT_JSON_PATH:-}
+      FCM_TOKEN_URI: ${FCM_TOKEN_URI:-https://oauth2.googleapis.com/token}
+      FCM_BASE_URL: ${FCM_BASE_URL:-https://fcm.googleapis.com}
+      SSO_SESSION_SECRET: ${SSO_SESSION_SECRET:-}
+      AULALITE_DATA_ENCRYPTION_KEY: ${AULALITE_DATA_ENCRYPTION_KEY:-}
+      AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS: ${AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS:-}
+      AULALITE_MFA_ENFORCE: ${AULALITE_MFA_ENFORCE:-false}
+      AULALITE_RATE_LIMIT: ${AULALITE_RATE_LIMIT:-false}
+      AULALITE_RATE_LIMIT_WINDOW_SECS: ${AULALITE_RATE_LIMIT_WINDOW_SECS:-60}
+      AULALITE_RATE_LIMIT_AUTH: ${AULALITE_RATE_LIMIT_AUTH:-120}
+      AULALITE_RATE_LIMIT_ANON: ${AULALITE_RATE_LIMIT_ANON:-30}
+      AULALITE_RATE_LIMIT_EDGE: ${AULALITE_RATE_LIMIT_EDGE:-600}
+      AULALITE_RATE_LIMIT_MFA: ${AULALITE_RATE_LIMIT_MFA:-10}
+      AULALITE_DKIM_SELECTOR: ${AULALITE_DKIM_SELECTOR:-}
+      AULALITE_DKIM_DOMAIN: ${AULALITE_DKIM_DOMAIN:-}
+      AULALITE_DKIM_PRIVATE_KEY: ${AULALITE_DKIM_PRIVATE_KEY:-}
+      BIND_ADDR: ${BIND_ADDR:-0.0.0.0:8080}
+      RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+    ports:
+      - "8080:8080"
+    volumes:
+      - mediamtx_recordings:/recordings:ro
+    healthcheck:
+      # Compose/deployment startup uses dependency-aware readiness. The image's
+      # own HEALTHCHECK retains `/healthz` as the process-only liveness probe.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: crates/shell-web/Dockerfile
+    restart: unless-stopped
+    # Publishable browser configuration only. Never put service-account,
+    # signing, provider, or database secrets in the frontend environment.
+    environment:
+      FIREBASE_WEB_API_KEY: ${FIREBASE_WEB_API_KEY:-}
+      FIREBASE_AUTH_DOMAIN: ${FIREBASE_AUTH_DOMAIN:-}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      FIREBASE_STORAGE_BUCKET: ${FIREBASE_STORAGE_BUCKET:-}
+      FIREBASE_MESSAGING_SENDER_ID: ${FIREBASE_MESSAGING_SENDER_ID:-}
+      FIREBASE_APP_ID: ${FIREBASE_APP_ID:-}
+      FIREBASE_MEASUREMENT_ID: ${FIREBASE_MEASUREMENT_ID:-}
+      FCM_VAPID_KEY: ${FCM_VAPID_KEY:-}
+      AULALITE_API_BASE_URL: ${AULALITE_API_BASE_URL:-}
+      AULALITE_APP_ORIGIN: ${AULALITE_APP_ORIGIN:-${APP_ORIGIN:-http://localhost:3000}}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:-}
+      AULALITE_REQUIRE_FIREBASE_CONFIG: ${AULALITE_REQUIRE_FIREBASE_CONFIG:-true}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      # nginx:alpine has no curl; wget is the BusyBox built-in. Use 127.0.0.1, not
+      # localhost: nginx listens on IPv4 0.0.0.0:3000 only, while BusyBox wget would
+      # resolve localhost to ::1 (IPv6) and get connection-refused. Lets Dokploy's
+      # rollback-on-health-failure see a wedged nginx (the frontend is the leaf
+      # service — nothing depends_on it — so this can never deadlock startup).
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  mediamtx:
+    # Bake the version-sensitive config into the pinned image. This remains
+    # stable when Dokploy replaces the repository checkout during auto-deploy.
+    build:
+      context: .
+      dockerfile: ops/mediamtx/Dockerfile
+    restart: unless-stopped
+    # Local dev publishes the signalling/HLS surfaces for direct inspection.
+    # Production routes those HTTP ports through Traefik and publishes only the
+    # ICE UDP listener; host networking is not required.
+    environment:
+      MEDIAMTX_AUTH_SHARED_HEADER: ${MEDIAMTX_AUTH_SHARED_HEADER:-changeme-mediamtx-auth-shared-secret}
+      # MediaMTX honours MTX_<UPPER> env-vars as overrides for config keys.
+      # Inject the shared secret into the auth-callback URL so the backend
+      # can validate the caller via the `?shared=` query param. This is the
+      # only mechanism that survives MediaMTX's HTTP-auth design (custom
+      # headers are not forwarded from yaml to the auth callback).
+      MTX_AUTHHTTPADDRESS: http://backend:8080/v1/mediamtx/auth/publish?shared=${MEDIAMTX_AUTH_SHARED_HEADER:-changeme-mediamtx-auth-shared-secret}
+      # MediaMTX list-valued env overrides are comma-separated. Local Docker
+      # advertises loopback; production must advertise the deploy node's public
+      # IP or media DNS name so remote clients receive a routable ICE candidate.
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_ADDITIONAL_HOSTS:-127.0.0.1}
+      # Do not leave MediaMTX's default wildcard CORS policy in an application
+      # stack. List-valued overrides accept comma-separated origins.
+      MTX_WEBRTCALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:-${APP_ORIGIN:-http://localhost:3000}}
+      MTX_HLSALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:-${APP_ORIGIN:-http://localhost:3000}}
+      # MediaMTX must gather its OWN reflexive/relay candidates. This Docker
+      # host is 192.168.1.2 behind NAT with no public IP, and a Cloudflare
+      # Tunnel forwards TCP only -- so MediaMTX's host candidates (loopback and
+      # LAN) are unreachable from a viewer on another network. Relaying the
+      # BROWSER alone still finds no path, because the other end of the
+      # candidate pair is MediaMTX itself. Index 0 is STUN (cheap srflx, which
+      # succeeds on cone NATs); index 1 is the same TURN relay the backend
+      # hands to browsers, so both ends can always meet on the relay.
+      MTX_WEBRTCICESERVERS2_0_URL: ${AULALITE_MEDIAMTX_STUN_URL:-stun:stun.l.google.com:19302}
+      MTX_WEBRTCICESERVERS2_1_URL: ${AULALITE_MEDIAMTX_TURN_URL:-${AULALITE_TURN_URL:-stun:stun.cloudflare.com:3478}}
+      MTX_WEBRTCICESERVERS2_1_USERNAME: ${AULALITE_TURN_USERNAME:-}
+      MTX_WEBRTCICESERVERS2_1_PASSWORD: ${AULALITE_TURN_CREDENTIAL:-}
+    ports:
+      # 8888 is deliberately NOT published here: the hls-gateway service owns
+      # the host port so it can answer `/` with a status response while
+      # proxying every real HLS request through to this container. MediaMTX is
+      # still reachable in-network at mediamtx:8888.
+      - "8889:8889/tcp"
+      - "8889:8889/udp"
+      # ICE UDP listener (MediaMTX default `webrtcLocalUDPAddress: :8189`).
+      # Without this, the browser cannot reach MediaMTX over UDP, ICE fails
+      # silently, and no RTP transits even though WHIP signaling succeeded.
+      - "8189:8189/udp"
+      - "9997:9997"
+      - "9998:9998"
+    volumes:
+      - mediamtx_recordings:/recordings
+
+  # Front door for the public HLS hostname (stream.elementors.guru ->
+  # localhost:8888). Answers exactly `/` and `/healthz` with a status payload
+  # so a reachability check does not look like a routing failure, and proxies
+  # everything else straight to MediaMTX. See ops/mediamtx/hls-gateway.conf for
+  # why it must not buffer.
+  hls-gateway:
+    image: nginxinc/nginx-unprivileged:alpine
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    volumes:
+      - ./ops/mediamtx/hls-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8888/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  pg_data:
+  redis_data:
+  rustfs_data:
+  mediamtx_recordings:

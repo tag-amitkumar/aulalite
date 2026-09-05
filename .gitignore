@@ -1,0 +1,37 @@
+/target
+/target-org-owner/
+/dist
+.worktrees/
+**/*.rs.bk
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+node_modules/
+.DS_Store
+.idea/
+.vscode/
+ios/build/
+android/build/
+*.xcuserstate
+
+# Local tool artifacts
+.claude/
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Local logical backup artifacts (contain customer data and credentials-adjacent metadata)
+/backups/
+
+# Transient build/test logs
+*.log
+
+# Cloudflare tunnel credentials and generated secrets
+ops/cloudflare/tunnel.env
+ops/cloudflare/config.yml
+ops/cloudflare/secrets.generated.env
+ops/cloudflare/jwt-rs256.key
+ops/cloudflare/*.json
+cert.pem

@@ -1,0 +1,92 @@
+[application]
+name = "AulaLite"
+default_platform = "mobile"
+out_dir = "dist"
+asset_dir = "../shell-web/public"
+android_main_activity = "android/MainActivity.kt"
+android_manifest = "android/AndroidManifest.xml"
+
+[bundle]
+identifier = "guru.elementors.aulalite"
+publisher = "Elementors"
+version = "0.1.0"
+file_version = "0.1.0.0"
+icon = [
+    "../design-system/assets/brand/app-icon-32.png",
+    "../design-system/assets/brand/app-icon-128.png",
+    "../design-system/assets/brand/app-icon-256.png",
+    "../design-system/assets/brand/app-icon-512.png",
+    "../design-system/assets/brand/app-icon-1024.png",
+]
+resources = []
+copyright = "Copyright 2026 Elementors. All rights reserved."
+category = "Education"
+short_description = "Your AulaLite academy, wherever learning happens."
+long_description = "AulaLite connects schools, coaching centres, independent teachers, students, and families through courses, schedules, assignments, and academy operations."
+
+[permissions]
+camera = { description = "AulaLite uses the camera for live classes and the pre-join preview." }
+microphone = { description = "AulaLite uses the microphone so you can teach and participate in live classes." }
+notifications = { description = "AulaLite sends class reminders, assignment updates, and important academy notifications." }
+
+[deep_links]
+schemes = ["aulalite"]
+hosts = ["aula.elementors.guru"]
+paths = ["/sso/finish", "/lti/landing"]
+
+[background]
+remote-notifications = true
+
+# Android release metadata comes first by design. Signing material stays in CI
+# / Play App Signing and is never committed to this file.
+[android]
+identifier = "guru.elementors.aulalite"
+min_sdk = 26
+target_sdk = 36
+compile_sdk = 36
+features = []
+gradle_dependencies = ["com.google.firebase:firebase-messaging:25.1.0"]
+
+[android.application]
+supports_rtl = true
+uses_cleartext_traffic = false
+
+[[android.intent_filters]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT", "android.intent.category.BROWSABLE"]
+auto_verify = true
+
+[[android.intent_filters.data]]
+scheme = "https"
+host = "aula.elementors.guru"
+path_prefix = "/sso/finish"
+
+[[android.intent_filters.data]]
+scheme = "https"
+host = "aula.elementors.guru"
+path_prefix = "/lti/landing"
+
+[android.queries]
+packages = []
+
+[[android.queries.intents]]
+action = "android.intent.action.VIEW"
+scheme = "https"
+
+[[android.queries.intents]]
+action = "android.intent.action.SEND"
+mime_type = "*/*"
+
+# Windows is distributed by the desktop crate; this ordering is mirrored in
+# its config so release checklists can audit Android -> Windows -> iOS.
+
+[ios]
+identifier = "guru.elementors.aulalite"
+deployment_target = "15.0"
+icon = ["../design-system/assets/brand/app-icon-ios-1024.png"]
+
+[ios.entitlements]
+associated-domains = ["applinks:aula.elementors.guru"]
+
+[ios.plist]
+ITSAppUsesNonExemptEncryption = false

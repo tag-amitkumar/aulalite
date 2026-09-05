@@ -1,0 +1,241 @@
+# Single-file production stack for Dokploy GitHub auto-deploy.
+#
+# In Dokploy select this exact file as the Compose Path, enable Isolated
+# Deployments, and add domains through the Domains UI. Dokploy injects the
+# Traefik labels and deployment network; no repository-owned proxy labels or
+# fixed HTTP host ports are required.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: ops/postgres/Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set the schema-owner database user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set the schema-owner database password}
+      POSTGRES_DB: ${POSTGRES_DB:?set the application database name}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?set the password used by the aulalite_app DATABASE_URL role}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  rustfs:
+    image: rustfs/rustfs:latest@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:?set a non-default object-store access key}
+      RUSTFS_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:?set a non-default object-store secret key}
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "false"
+    expose:
+      - "9000"
+    volumes:
+      - rustfs_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || wget -qO- http://127.0.0.1:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  backend:
+    build:
+      context: .
+      dockerfile: crates/backend/Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    environment:
+      APP_ENV: production
+      APP_ORIGIN: ${APP_ORIGIN:?set https://aula.elementors.guru}
+      API_ORIGIN: ${API_ORIGIN:?set https://api.aula.elementors.guru}
+      AULALITE_BROWSER_ORIGINS: ${AULALITE_BROWSER_ORIGINS:?set https://aula.elementors.guru,https://admin.elementors.guru}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:?set https://admin.elementors.guru}
+      AULALITE_SUPER_ADMIN_EMAILS: ${AULALITE_SUPER_ADMIN_EMAILS:?set at least one super-admin email}
+      SELF_SERVICE_SIGNUP_ENABLED: ${SELF_SERVICE_SIGNUP_ENABLED:?set true for public signup or false for invite-only}
+      DATABASE_URL: ${DATABASE_URL:?set the aulalite_app runtime connection URL}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:?set the schema-owner migration connection URL}
+      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-20}
+      DB_MIN_CONNECTIONS: ${DB_MIN_CONNECTIONS:-0}
+      DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-10}
+      DB_IDLE_TIMEOUT_SECS: ${DB_IDLE_TIMEOUT_SECS:-600}
+      DB_MAX_LIFETIME_SECS: ${DB_MAX_LIFETIME_SECS:-1800}
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?set https://storage.elementors.guru}
+      S3_INTERNAL_ENDPOINT_URL: http://rustfs:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-aulalite}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set a non-default object-store access key}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set a non-default object-store secret key}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?set the Firebase project ID}
+      FIREBASE_JWKS_URL: ${FIREBASE_JWKS_URL:?set the Firebase JWKS URL}
+      FIREBASE_TOKEN_ISSUER: ${FIREBASE_TOKEN_ISSUER:?set the Firebase token issuer}
+      FIREBASE_WEB_API_KEY: ${FIREBASE_WEB_API_KEY:?set the publishable Firebase web API key}
+      FIREBASE_AUTH_DOMAIN: ${FIREBASE_AUTH_DOMAIN:?set the Firebase auth domain}
+      JWT_RS256_PRIVATE_KEY_PEM: ${JWT_RS256_PRIVATE_KEY_PEM:?set the persistent viewer-token RSA private key PEM}
+      MEDIAMTX_HTTP_URL: http://mediamtx:9997
+      MEDIAMTX_PUBLIC_WEBRTC_URL: ${MEDIAMTX_PUBLIC_WEBRTC_URL:?set https://live.elementors.guru}
+      MEDIAMTX_PUBLIC_HLS_URL: ${MEDIAMTX_PUBLIC_HLS_URL:?set https://stream.elementors.guru}
+      MEDIAMTX_AUTH_SHARED_HEADER: ${MEDIAMTX_AUTH_SHARED_HEADER:?set a unique MediaMTX callback secret}
+      AULALITE_TURN_URL: ${AULALITE_TURN_URL:-}
+      AULALITE_TURN_USERNAME: ${AULALITE_TURN_USERNAME:-}
+      AULALITE_TURN_CREDENTIAL: ${AULALITE_TURN_CREDENTIAL:-}
+      RECORDINGS_DIR: /recordings
+      LIVE_ROOM_CHAT_RETENTION_DAYS: ${LIVE_ROOM_CHAT_RETENTION_DAYS:-90}
+      LIVE_ROOM_RECORDING_RETENTION_DAYS: ${LIVE_ROOM_RECORDING_RETENTION_DAYS:-365}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?set the Stripe live secret key}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?set the Stripe webhook signing secret}
+      STRIPE_PRICE_ID_STARTER: ${STRIPE_PRICE_ID_STARTER:-}
+      STRIPE_PRICE_ID_PRO: ${STRIPE_PRICE_ID_PRO:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:?set the transactional email provider key}
+      RESEND_FROM: ${RESEND_FROM:?set a verified transactional sender identity}
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID:-}
+      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
+      FCM_SERVICE_ACCOUNT_JSON_PATH: ${FCM_SERVICE_ACCOUNT_JSON_PATH:-}
+      FCM_TOKEN_URI: ${FCM_TOKEN_URI:-https://oauth2.googleapis.com/token}
+      FCM_BASE_URL: ${FCM_BASE_URL:-https://fcm.googleapis.com}
+      SSO_SESSION_SECRET: ${SSO_SESSION_SECRET:?set a random secret of at least 32 characters}
+      AULALITE_DATA_ENCRYPTION_KEY: ${AULALITE_DATA_ENCRYPTION_KEY:?set a base64-encoded 32-byte data encryption key}
+      AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS: ${AULALITE_DATA_ENCRYPTION_KEY_PREVIOUS:-}
+      AULALITE_MFA_ENFORCE: "true"
+      AULALITE_RATE_LIMIT: "true"
+      AULALITE_RATE_LIMIT_WINDOW_SECS: ${AULALITE_RATE_LIMIT_WINDOW_SECS:-60}
+      AULALITE_RATE_LIMIT_AUTH: ${AULALITE_RATE_LIMIT_AUTH:-120}
+      AULALITE_RATE_LIMIT_ANON: ${AULALITE_RATE_LIMIT_ANON:-30}
+      AULALITE_RATE_LIMIT_EDGE: ${AULALITE_RATE_LIMIT_EDGE:-600}
+      AULALITE_RATE_LIMIT_MFA: ${AULALITE_RATE_LIMIT_MFA:-10}
+      AULALITE_DKIM_SELECTOR: ${AULALITE_DKIM_SELECTOR:-}
+      AULALITE_DKIM_DOMAIN: ${AULALITE_DKIM_DOMAIN:-}
+      AULALITE_DKIM_PRIVATE_KEY: ${AULALITE_DKIM_PRIVATE_KEY:-}
+      LOCAL_LOGIN_BYPASS_ENABLED: "false"
+      LOCAL_AUDIT_SEED_ENABLED: "false"
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+    expose:
+      - "8080"
+    volumes:
+      - mediamtx_recordings:/recordings:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  frontend:
+    build:
+      context: .
+      dockerfile: crates/shell-web/Dockerfile
+    restart: unless-stopped
+    environment:
+      FIREBASE_WEB_API_KEY: ${FIREBASE_WEB_API_KEY:?set the publishable Firebase web API key}
+      FIREBASE_AUTH_DOMAIN: ${FIREBASE_AUTH_DOMAIN:?set the Firebase auth domain}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?set the Firebase project ID}
+      FIREBASE_STORAGE_BUCKET: ${FIREBASE_STORAGE_BUCKET:-}
+      FIREBASE_MESSAGING_SENDER_ID: ${FIREBASE_MESSAGING_SENDER_ID:-}
+      FIREBASE_APP_ID: ${FIREBASE_APP_ID:-}
+      FIREBASE_MEASUREMENT_ID: ${FIREBASE_MEASUREMENT_ID:-}
+      FCM_VAPID_KEY: ${FCM_VAPID_KEY:-}
+      AULALITE_API_BASE_URL: ${AULALITE_API_BASE_URL:?set https://api.aula.elementors.guru}
+      AULALITE_APP_ORIGIN: ${AULALITE_APP_ORIGIN:?set https://aula.elementors.guru}
+      AULALITE_ADMIN_ORIGIN: ${AULALITE_ADMIN_ORIGIN:?set https://admin.elementors.guru}
+      AULALITE_REQUIRE_FIREBASE_CONFIG: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  mediamtx:
+    build:
+      context: .
+      dockerfile: ops/mediamtx/Dockerfile
+    restart: unless-stopped
+    environment:
+      MEDIAMTX_AUTH_SHARED_HEADER: ${MEDIAMTX_AUTH_SHARED_HEADER:?set a unique MediaMTX callback secret}
+      MTX_AUTHHTTPADDRESS: http://backend:8080/v1/mediamtx/auth/publish?shared=${MEDIAMTX_AUTH_SHARED_HEADER:?set a unique MediaMTX callback secret}
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_ADDITIONAL_HOSTS:?set the public deploy-node IP or live media DNS hostname}
+      MTX_WEBRTCALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:?set the app and admin origins}
+      MTX_HLSALLOWORIGINS: ${AULALITE_BROWSER_ORIGINS:?set the app and admin origins}
+    expose:
+      - "8888"
+      - "8889"
+    ports:
+      - "8189:8189/udp"
+    volumes:
+      - mediamtx_recordings:/recordings
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+volumes:
+  pg_data:
+  redis_data:
+  rustfs_data:
+  mediamtx_recordings:

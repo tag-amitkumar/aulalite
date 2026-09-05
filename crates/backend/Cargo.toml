@@ -1,0 +1,276 @@
+# crates/backend/Cargo.toml
+[package]
+name = "backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autotests = false
+
+[lib]
+name = "backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backend"
+path = "src/main.rs"
+
+[features]
+db-tests = []
+
+[[test]]
+name = "health"
+path = "tests/health.rs"
+
+[[test]]
+name = "analytics"
+path = "tests/analytics.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "assignment_policy"
+path = "tests/assignment_policy.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "assignments_crud"
+path = "tests/assignments_crud.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "assignments_permissions"
+path = "tests/assignments_permissions.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "attendance"
+path = "tests/attendance.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "audit_seed"
+path = "tests/audit_seed.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "billing"
+path = "tests/billing.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "branding"
+path = "tests/branding.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "certificates"
+path = "tests/certificates.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "course_cover_upload"
+path = "tests/course_cover_upload.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "course_detail_tabs"
+path = "tests/course_detail_tabs.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "course_invitations"
+path = "tests/course_invitations.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "course_tenant_scope"
+path = "tests/course_tenant_scope.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "courses_crud"
+path = "tests/courses_crud.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "enrollment_codes"
+path = "tests/enrollment_codes.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "flashcards"
+path = "tests/flashcards.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "gamification"
+path = "tests/gamification.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "jit_provision"
+path = "tests/jit_provision.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "lesson_attachments"
+path = "tests/lesson_attachments.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "lessons_crud"
+path = "tests/lessons_crud.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "live_room"
+path = "tests/live_room.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "live_session_series"
+path = "tests/live_session_series.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "local_login_bypass"
+path = "tests/local_login_bypass.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "lti_state"
+path = "tests/lti_state.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "me_endpoint"
+path = "tests/me_endpoint.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "member_invitations"
+path = "tests/member_invitations.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "membership_admin"
+path = "tests/membership_admin.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "mfa"
+path = "tests/mfa.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "modules_crud"
+path = "tests/modules_crud.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "notifications"
+path = "tests/notifications.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "parent"
+path = "tests/parent.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "permissions_matrix"
+path = "tests/permissions_matrix.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "platform_admin"
+path = "tests/platform_admin.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "progress"
+path = "tests/progress.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "quizzes"
+path = "tests/quizzes.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "recording"
+path = "tests/recording.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "rls_tenant_isolation"
+path = "tests/rls_tenant_isolation.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "search"
+path = "tests/search.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "start_now"
+path = "tests/start_now.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "submissions_flow"
+path = "tests/submissions_flow.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "uploads"
+path = "tests/uploads.rs"
+required-features = ["db-tests"]
+
+[[test]]
+name = "uploads_validation_matrix"
+path = "tests/uploads_validation_matrix.rs"
+required-features = ["db-tests"]
+
+[dependencies]
+core-types = { path = "../core-types" }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+bigdecimal = { version = "0.4", features = ["serde"] }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+fred = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+rsa = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-credential-types = { workspace = true }
+serde_with = { workspace = true }
+futures-util = "0.3"
+percent-encoding = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+http-body-util = "0.1"
+tower = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tempfile = "3"

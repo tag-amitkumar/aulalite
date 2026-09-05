@@ -1,0 +1,22 @@
+# crates/shell-mobile/Cargo.toml
+[package]
+name = "shell-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+dioxus = { workspace = true, features = ["mobile"] }
+shell-web = { path = "../shell-web", default-features = false }
+platform-bridge = { path = "../platform-bridge" }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+dioxus-ssr = "=0.7.10"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

@@ -1,0 +1,26 @@
+target
+dist
+.git
+.env
+.env.*
+*.env
+node_modules
+ios/build
+android/build
+docs
+
+# Transient tool / test / editor artifacts — none are COPYied by the Dockerfiles
+# (which pull only Cargo manifests, crates/, tools/, migrations/), so excluding
+# them only shrinks the build context tarball.
+*.log
+.worktrees
+.claude
+.idea
+.vscode
+test-results
+playwright-report
+.playwright-mcp
+sim-screenshots
+Reading_Material
+**/*.rs.bk
+.DS_Store

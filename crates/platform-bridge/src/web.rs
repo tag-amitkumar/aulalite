@@ -1,0 +1,251 @@
+#![cfg(target_arch = "wasm32")]
+
+use async_trait::async_trait;
+use wasm_bindgen::prelude::*;
+
+use crate::{BridgeError, PlatformBridge};
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = ["aula", "fb"], js_name = signIn, catch)]
+    async fn js_sign_in(email: &str, password: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["aula", "fb"], js_name = signUp, catch)]
+    async fn js_sign_up(email: &str, password: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["aula", "fb"], js_name = signOut, catch)]
+    async fn js_sign_out() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["aula", "fb"], js_name = forgot, catch)]
+    async fn js_forgot(email: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["aula", "fb"], js_name = currentIdToken, catch)]
+    async fn js_current_id_token() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["aula", "fcm"], js_name = requestToken, catch)]
+    async fn js_fcm_request_token() -> Result<JsValue, JsValue>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FcmRequestTokenOutcome {
+    Token(String),
+    MissingVapidKey,
+    Unsupported,
+    PermissionDenied,
+    ServiceWorkerFailed,
+    TokenFailed,
+}
+
+/// Request an FCM web-push registration token, preserving backwards
+/// compatibility for callers that only need token-or-none.
+pub async fn fcm_request_token() -> Result<Option<String>, BridgeError> {
+    match fcm_request_token_outcome().await? {
+        FcmRequestTokenOutcome::Token(token) => Ok(Some(token)),
+        _ => Ok(None),
+    }
+}
+
+/// Request an FCM web-push registration token and classify graceful setup
+/// failures so the UI can show specific state.
+pub async fn fcm_request_token_outcome() -> Result<FcmRequestTokenOutcome, BridgeError> {
+    let value = js_fcm_request_token().await?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(FcmRequestTokenOutcome::TokenFailed);
+    }
+    if let Some(token) = value.as_string() {
+        persist_fcm_token(&token);
+        return Ok(FcmRequestTokenOutcome::Token(token));
+    }
+    let status = js_sys::Reflect::get(&value, &JsValue::from_str("status"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "token_failed".into());
+    let token = js_sys::Reflect::get(&value, &JsValue::from_str("token"))
+        .ok()
+        .and_then(|v| v.as_string());
+    let outcome = match (status.as_str(), token) {
+        ("token", Some(token)) => FcmRequestTokenOutcome::Token(token),
+        ("missing_vapid_key", _) => FcmRequestTokenOutcome::MissingVapidKey,
+        ("unsupported", _) => FcmRequestTokenOutcome::Unsupported,
+        ("permission_denied", _) => FcmRequestTokenOutcome::PermissionDenied,
+        ("service_worker_failed", _) => FcmRequestTokenOutcome::ServiceWorkerFailed,
+        _ => FcmRequestTokenOutcome::TokenFailed,
+    };
+    if let FcmRequestTokenOutcome::Token(token) = &outcome {
+        persist_fcm_token(token);
+    }
+    Ok(outcome)
+}
+
+/// localStorage key mirroring the dev "local-login" bypass token. The Firebase
+/// JS SDK persists its own session in IndexedDB, but the local-login bypass has
+/// no such persistence — so we stash its token here to survive a full page
+/// reload (otherwise every refresh silently logs the dev user out).
+const LOCAL_TOKEN_KEY: &str = "aulalite.local_token";
+const FCM_TOKEN_KEY: &str = "aulalite.fcm_token";
+const TRUSTED_DEVICE_PREFIX: &str = "aulalite.mfa_trusted_device.";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// Persist the local-login bypass token (dev only). No-op if storage is
+/// unavailable (private mode / disabled).
+pub fn persist_local_token(token: &str) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(LOCAL_TOKEN_KEY, token);
+    }
+}
+
+/// Read a previously-persisted local-login token, if any (non-empty).
+pub fn local_token() -> Option<String> {
+    local_storage()
+        .and_then(|s| s.get_item(LOCAL_TOKEN_KEY).ok().flatten())
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Remove the persisted local-login token (on sign-out, or when the bootstrap
+/// finds it stale/rejected).
+pub fn clear_local_token() {
+    if let Some(storage) = local_storage() {
+        let _ = storage.remove_item(LOCAL_TOKEN_KEY);
+    }
+}
+
+fn persist_fcm_token(token: &str) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(FCM_TOKEN_KEY, token);
+    }
+}
+
+pub fn fcm_token() -> Option<String> {
+    local_storage()
+        .and_then(|storage| storage.get_item(FCM_TOKEN_KEY).ok().flatten())
+        .filter(|token| !token.trim().is_empty())
+}
+
+pub fn clear_fcm_token() {
+    if let Some(storage) = local_storage() {
+        let _ = storage.remove_item(FCM_TOKEN_KEY);
+    }
+}
+
+fn trusted_device_key(email: &str) -> String {
+    format!(
+        "{TRUSTED_DEVICE_PREFIX}{}",
+        email.trim().to_ascii_lowercase()
+    )
+}
+
+/// sessionStorage, not localStorage: the trusted-device token is a 30-day
+/// second-factor bypass, so it must not sit in persistent storage where any
+/// XSS payload could exfiltrate it at leisure. Tab-scoped storage keeps the
+/// "remember this browser" convenience for the active session while shrinking
+/// the theft window to a single tab's lifetime.
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.session_storage().ok().flatten())
+}
+
+pub fn persist_trusted_device_token(email: &str, token: &str) {
+    // Purge any pre-hardening copy that may still sit in localStorage.
+    if let Some(persistent) = local_storage() {
+        let _ = persistent.remove_item(&trusted_device_key(email));
+    }
+    if let Some(storage) = session_storage() {
+        let _ = storage.set_item(&trusted_device_key(email), token);
+    }
+}
+
+pub fn trusted_device_token(email: &str) -> Option<String> {
+    session_storage()
+        .and_then(|s| s.get_item(&trusted_device_key(email)).ok().flatten())
+        .filter(|t| !t.trim().is_empty())
+}
+
+pub fn clear_trusted_device_token(email: &str) {
+    if let Some(storage) = session_storage() {
+        let _ = storage.remove_item(&trusted_device_key(email));
+    }
+}
+
+pub fn clear_all_trusted_device_tokens() {
+    // Also purge legacy localStorage copies from pre-hardening deployments.
+    if let Some(persistent) = local_storage() {
+        let mut legacy = Vec::new();
+        for i in 0..persistent.length().unwrap_or(0) {
+            if let Ok(Some(key)) = persistent.key(i) {
+                if key.starts_with(TRUSTED_DEVICE_PREFIX) {
+                    legacy.push(key);
+                }
+            }
+        }
+        for key in legacy {
+            let _ = persistent.remove_item(&key);
+        }
+    }
+    let Some(storage) = session_storage() else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for i in 0..storage.length().unwrap_or(0) {
+        if let Ok(Some(key)) = storage.key(i) {
+            if key.starts_with(TRUSTED_DEVICE_PREFIX) {
+                keys.push(key);
+            }
+        }
+    }
+    for key in keys {
+        let _ = storage.remove_item(&key);
+    }
+}
+
+pub struct WebBridge;
+
+#[async_trait(?Send)]
+impl PlatformBridge for WebBridge {
+    async fn current_id_token(&self) -> Result<String, BridgeError> {
+        token_from_js(js_current_id_token().await?)
+    }
+
+    async fn sign_in_email_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<String, BridgeError> {
+        token_from_js(js_sign_in(email, password).await?)
+    }
+
+    async fn sign_up_email_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<String, BridgeError> {
+        token_from_js(js_sign_up(email, password).await?)
+    }
+
+    async fn sign_out(&self) -> Result<(), BridgeError> {
+        // Drop any persisted local-login bypass token so a dev sign-out is not
+        // silently undone by the bootstrap fallback on the next page load.
+        clear_local_token();
+        clear_all_trusted_device_tokens();
+        js_sign_out().await?;
+        Ok(())
+    }
+
+    async fn send_password_reset(&self, email: &str) -> Result<(), BridgeError> {
+        js_forgot(email).await?;
+        Ok(())
+    }
+}
+
+impl From<JsValue> for BridgeError {
+    fn from(value: JsValue) -> Self {
+        BridgeError::Io(format!("{value:?}"))
+    }
+}
+
+fn token_from_js(value: JsValue) -> Result<String, BridgeError> {
+    value
+        .as_string()
+        .ok_or_else(|| BridgeError::Io("no token".into()))
+}

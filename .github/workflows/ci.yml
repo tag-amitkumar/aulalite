@@ -1,0 +1,486 @@
+name: CI (manual, zero push minutes)
+
+on:
+  # Deliberately manual-only: normal GitHub pushes deploy through Dokploy's
+  # GitHub App and consume no GitHub Actions minutes. Run this workflow only
+  # when Actions credit is intentionally available; use the local release
+  # preflight documented in ops/README.md before every production push.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DIOXUS_VERSION: "0.7.9"
+  # Keep peak RAM bounded on the shared runners (mirrors the Dockerfile caps in
+  # ops/README.md that prevent concurrent-build OOM).
+  CARGO_BUILD_JOBS: "4"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Formatting — CHECK ONLY.
+  #
+  # NEVER run `cargo fmt --all` in this repo: rustfmt-version skew reformats ~70
+  # unrelated files (see memory: cargo-fmt-reformats-whole-repo). We only verify.
+  # The repository pins its Rust/rustfmt version, so formatting remains a
+  # release gate even though this hosted workflow is manual-only.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt (check only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # rust-toolchain.toml pins channel 1.94 + rustfmt/clippy + wasm target,
+      # so dtolnay/rust-toolchain auto-honours it. We name the components anyway
+      # to be explicit and resilient if the file ever moves.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  # ---------------------------------------------------------------------------
+  # 2) Clippy — workspace lint, deny warnings.
+  #
+  # Warnings are denied. Keep local and hosted toolchains aligned through
+  # rust-toolchain.toml before changing the lint baseline.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy
+          # Native (non-wasm) lint pass; the wasm build is checked separately.
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # 3a) Fast unit tests — NO Postgres.
+  #
+  # `cargo test --workspace --lib` only runs the in-crate `#[cfg(test)]` units
+  # (design-system, features, backend pure logic). The integration tests under
+  # crates/backend/tests/ are NOT --lib, so they are excluded here and this job
+  # needs no database and gives quick signal in an intentional manual run.
+  # ---------------------------------------------------------------------------
+  test-unit:
+    name: unit tests (no Postgres)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-unit
+      - name: cargo test --workspace --lib
+        run: cargo test --workspace --lib
+
+  # ---------------------------------------------------------------------------
+  # 3b) Full workspace tests — WITH Postgres 16 service container.
+  #
+  # The integration suite (crates/backend/tests/) connects to DATABASE_URL and
+  # expects the schema present. The backend self-migrates at boot via
+  # `sqlx::migrate!("../../migrations")`, but the test harness does NOT run
+  # migrations (fixtures only connect a pool), so CI applies them first with
+  # sqlx-cli. The plain `postgres:16` image ships contrib (pg_trgm / citext /
+  # uuid-ossp) that migration 20260503000001_extensions.sql needs.
+  # ---------------------------------------------------------------------------
+  test-integration:
+    name: integration tests (Postgres 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aulalite
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: aulalite
+        ports:
+          - 5432:5432
+        # Wait until Postgres accepts connections before the job's steps run.
+        options: >-
+          --health-cmd "pg_isready -U aulalite -d aulalite"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Host-mapped service port. Migrations run as the owner `aulalite` role
+      # (superuser in the container) so CREATE EXTENSION + RLS DDL and direct
+      # fixture seeding succeed. The dedicated rls_tenant_isolation.rs suite
+      # creates and SET ROLEs to non-bypass identities before policy assertions;
+      # setting app GUCs alone would not exercise RLS through this owner login.
+      DATABASE_URL: postgres://aulalite:changeme@localhost:5432/aulalite
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-integration
+      # sqlx-cli applies the forward-only SQL in migrations/ exactly as the
+      # backend would on boot. --no-default-features + rustls keeps the install
+      # lean and TLS-consistent with the workspace (sqlx uses tls-rustls).
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+      - name: Apply migrations
+        run: sqlx migrate run --source migrations
+      - name: Ensure PostgreSQL client is available
+        shell: bash
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends postgresql-client
+          fi
+      - name: Verify least-privileged runtime role through an actual login
+        shell: bash
+        run: |
+          runtime_password="ci-runtime-$(openssl rand -hex 16)"
+          tenant_id="00000000-0000-4000-8000-0000000000c1"
+          other_tenant_id="00000000-0000-4000-8000-0000000000c2"
+
+          psql "$DATABASE_URL" --no-psqlrc --set ON_ERROR_STOP=1 \
+            --set runtime_password="$runtime_password" \
+            --set tenant_id="$tenant_id" <<'SQL'
+          ALTER ROLE aulalite_app PASSWORD :'runtime_password';
+          INSERT INTO tenants
+            (id, slug, name, status, ownership_initialized_at)
+          VALUES
+            (:'tenant_id', 'ci-runtime-role-contract',
+             'CI runtime role contract', 'active', NULL);
+          SQL
+
+          PGPASSWORD="$runtime_password" psql \
+            "postgresql://aulalite_app@localhost:5432/aulalite" \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --set tenant_id="$tenant_id" \
+            --set other_tenant_id="$other_tenant_id" <<'SQL'
+          SELECT (
+              current_user = 'aulalite_app'
+              AND session_user = 'aulalite_app'
+              AND runtime_role.rolcanlogin
+              AND NOT runtime_role.rolsuper
+              AND NOT runtime_role.rolbypassrls
+              AND NOT runtime_role.rolcreatedb
+              AND NOT runtime_role.rolcreaterole
+              AND NOT runtime_role.rolreplication
+              AND NOT has_schema_privilege(current_user, 'public', 'CREATE')
+              AND NOT has_table_privilege(
+                  current_user,
+                  'public._sqlx_migrations',
+                  'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_auth_members membership
+                  WHERE membership.member = runtime_role.oid
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_class relation
+                  JOIN pg_namespace namespace
+                    ON namespace.oid = relation.relnamespace
+                  WHERE namespace.nspname = 'public'
+                    AND relation.relowner = runtime_role.oid
+              )
+          ) AS runtime_role_ok
+          FROM pg_roles runtime_role
+          WHERE runtime_role.rolname = current_user
+          \gset
+
+          \if :runtime_role_ok
+          \else
+            \echo 'aulalite_app violates the runtime-role contract'
+            \quit 1
+          \endif
+
+          BEGIN;
+          SELECT set_config('app.tenant_id', :'other_tenant_id', true);
+          SELECT count(*) = 0 AS cross_tenant_hidden
+          FROM tenants WHERE id = :'tenant_id'
+          \gset
+
+          SELECT set_config('app.tenant_id', :'tenant_id', true);
+          SELECT count(*) = 1 AS same_tenant_visible
+          FROM tenants WHERE id = :'tenant_id'
+          \gset
+          ROLLBACK;
+
+          \if :cross_tenant_hidden
+          \else
+            \echo 'cross-tenant row was visible'
+            \quit 1
+          \endif
+
+          \if :same_tenant_visible
+          \else
+            \echo 'same-tenant row was not visible'
+            \quit 1
+          \endif
+          SQL
+
+          psql "$DATABASE_URL" --no-psqlrc --set ON_ERROR_STOP=1 \
+            --set tenant_id="$tenant_id" <<'SQL'
+          DELETE FROM tenants WHERE id = :'tenant_id';
+          SQL
+      - name: cargo test --workspace (service-free targets)
+        run: cargo test --workspace
+      # Backend DB targets are explicitly feature-gated so the service-free
+      # developer command above remains fast. Enable the feature here or Cargo
+      # silently skips the entire integration suite.
+      - name: cargo test backend DB integration suite
+        run: cargo test -p backend --features db-tests --tests
+
+  # ---------------------------------------------------------------------------
+  # 4) Web release bundle — framework/CLI lockstep plus the real Dioxus build.
+  #
+  # `cargo check --target wasm32` catches cfg-specific Rust errors, while `dx
+  # build --release` additionally exercises wasm-bindgen, optimization, asset
+  # collection, the PWA shell and the exact directory copied by the image.
+  # ---------------------------------------------------------------------------
+  wasm:
+    name: web release bundle (Dioxus 0.7.9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: wasm32-unknown-unknown
+      # Redundant with the pinned rust-toolchain.toml `targets`, but explicit and
+      # harmless — guarantees the target exists regardless of toolchain resolution.
+      - name: Ensure wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Verify Dioxus framework, helpers, CLI and lockfile stay aligned
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          expected = os.environ["DIOXUS_VERSION"]
+          root = pathlib.Path(".")
+          workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+          dependencies = workspace["workspace"]["dependencies"]
+          assert dependencies["dioxus"] == f"={expected}"
+          assert dependencies["dioxus-router"] == f"={expected}"
+
+          ssr_manifests = [
+              "crates/design-system/Cargo.toml",
+              "crates/features-auth/Cargo.toml",
+              "crates/features-courses/Cargo.toml",
+              "crates/shell-mobile/Cargo.toml",
+              "crates/shell-web/Cargo.toml",
+          ]
+          for manifest_path in ssr_manifests:
+              manifest = tomllib.loads((root / manifest_path).read_text(encoding="utf-8"))
+              actual = manifest["dev-dependencies"]["dioxus-ssr"]
+              assert actual == f"={expected}", f"{manifest_path}: dioxus-ssr={actual}"
+
+          lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+          versions = {
+              package["version"]
+              for package in lock["package"]
+              if (package["name"] == "dioxus" or package["name"].startswith("dioxus-"))
+              and package["name"] != "dioxus-free-icons"
+          }
+          assert versions == {expected}, f"Dioxus lockfile versions are {sorted(versions)}"
+
+          dockerfile = (root / "crates/shell-web/Dockerfile").read_text(encoding="utf-8")
+          assert f"dioxus-cli --version {expected} --locked" in dockerfile
+          release_doc = (root / "docs/native-release.md").read_text(encoding="utf-8")
+          assert f"dioxus-cli --version {expected} --locked" in release_doc
+          PY
+      - name: cargo check -p features-courses (wasm32)
+        run: cargo check -p features-courses --target wasm32-unknown-unknown
+      - name: Install matching Dioxus CLI
+        run: cargo install dioxus-cli --version "$DIOXUS_VERSION" --locked
+      - name: Build production web bundle
+        run: |
+          # rust-cache may restore an earlier fingerprinted Dioxus dist. Clear
+          # only generated web output so stale bundles cannot enter a release.
+          rm -rf target/dx/shell-web/release/web
+          dx build --package shell-web --platform web --release
+      - name: Verify production bundle contract
+        shell: bash
+        run: |
+          dist=target/dx/shell-web/release/web/public
+          test -s "$dist/index.html"
+          test -s "$dist/manifest.webmanifest"
+          test -s "$dist/service-worker.js"
+          test -s "$dist/firebase-messaging-sw.js"
+          test -s "$dist/runtime-config.js"
+          test -s "$dist/assets/brand/app-icon-256.png"
+          test -s "$dist/assets/brand/app-icon-512.png"
+          test "$(find "$dist/assets" -maxdepth 1 -name 'shell-web_bg-*.wasm' -size +0 | wc -l)" -eq 1
+          test "$(find "$dist/assets" -maxdepth 1 -name 'shell-web-*.js' -size +0 | wc -l)" -eq 1
+          python3 -m json.tool "$dist/manifest.webmanifest" >/dev/null
+          for script in \
+            crates/shell-web/public/service-worker.js \
+            crates/shell-web/public/firebase-messaging-sw.js \
+            crates/shell-web/public/runtime-config.js \
+            crates/shell-web/public/assets/*.js
+          do
+            node --check "$script"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 4b) Native shell contract — exercise the renderer-neutral route graph with
+  # the desktop and mobile renderers selected explicitly. A host check does not
+  # replace signed device builds, but it prevents web-only dependencies or
+  # shared-route regressions from silently breaking both native entry points.
+  # ---------------------------------------------------------------------------
+  native-shells:
+    name: native shells (Windows host)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-shells-windows
+      - name: Check native platform bridge and shells
+        run: >-
+          cargo check
+          -p platform-bridge
+          -p shell-desktop
+          -p shell-mobile
+          --all-targets
+      - name: Verify native static-asset contract
+        shell: pwsh
+        run: |
+          $required = @(
+            "crates/shell-web/public/assets/tokens.css",
+            "crates/shell-web/public/assets/components.css",
+            "crates/shell-web/public/assets/fonts/Inter-Variable.woff2",
+            "crates/shell-web/public/assets/fonts/Inter-Italic-Variable.woff2",
+            "crates/shell-web/public/assets/fonts/SourceSerif4-Variable.woff2",
+            "crates/shell-web/public/assets/fonts/SourceSerif4-Italic-Variable.woff2",
+            "crates/shell-web/public/assets/brand/aulalite-mark.svg",
+            "crates/shell-web/public/assets/brand/academy-hero.png",
+            "crates/shell-web/public/assets/brand/course-cover-academy.png"
+          )
+          $missing = $required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }
+          if ($missing) {
+            throw "Native asset_dir contract is missing: $($missing -join ', ')"
+          }
+          foreach ($config in @("crates/shell-desktop/Dioxus.toml", "crates/shell-mobile/Dioxus.toml")) {
+            if (-not (Select-String -LiteralPath $config -Quiet -SimpleMatch 'asset_dir = "../shell-web/public"')) {
+              throw "$config no longer packages the shared public asset directory"
+            }
+          }
+
+  # ---------------------------------------------------------------------------
+  # 5) Deployment contract — local overlays and the single-file Dokploy model
+  # must both render from committed, secret-free environment templates.
+  # ---------------------------------------------------------------------------
+  compose-config:
+    name: production Compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate operations shell scripts
+        run: |
+          bash -n ops/backup/postgres-backup.sh
+          bash -n ops/backup/postgres-restore-verify.sh
+          bash -n ops/backup/upload-hook.example.sh
+          sh -n ops/postgres/10-init-runtime-role.sh
+      - name: Validate production overlay model
+        # Compose's production overlay intentionally rejects blank secrets.
+        # These inert CI-only values exercise interpolation without weakening
+        # the deploy-time requirement or committing usable credentials.
+        env:
+          APP_ORIGIN: https://app.ci.example.test
+          SSO_SESSION_SECRET: ci-only-session-secret-at-least-32-characters
+          AULALITE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          RESEND_API_KEY: re_ci_only_not_a_real_key
+          RESEND_FROM: AulaLite CI <notifications@ci.example.test>
+          MEDIAMTX_PUBLIC_WEBRTC_URL: https://media.ci.example.test
+          MEDIAMTX_PUBLIC_HLS_URL: https://media.ci.example.test
+        run: >-
+          docker compose --env-file .env.example
+          -f docker-compose.yml -f docker-compose.prod.yml
+          config --quiet
+      - name: Validate standalone Dokploy model
+        # Dokploy reads this one file, injects its domain/network labels, and
+        # builds it from a fresh Git clone on every selected-branch push.
+        env:
+          POSTGRES_PASSWORD: ci-owner-password
+          POSTGRES_RUNTIME_PASSWORD: ci-runtime-password
+          AWS_ACCESS_KEY_ID: ci-object-store-access
+          AWS_SECRET_ACCESS_KEY: ci-object-store-secret
+          FIREBASE_PROJECT_ID: ci-firebase-project
+          FIREBASE_WEB_API_KEY: ci-publishable-web-key
+          JWT_RS256_PRIVATE_KEY_PEM: ci-not-a-real-private-key
+          MEDIAMTX_ADDITIONAL_HOSTS: 192.0.2.10
+          MEDIAMTX_AUTH_SHARED_HEADER: ci-media-auth-secret
+          STRIPE_SECRET_KEY: sk_test_ci_only
+          STRIPE_WEBHOOK_SECRET: whsec_ci_only
+          RESEND_API_KEY: re_ci_only_not_a_real_key
+          RESEND_FROM: AulaLite CI <notifications@ci.example.test>
+          SSO_SESSION_SECRET: ci-only-session-secret-at-least-32-characters
+          AULALITE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: >-
+          docker compose --env-file ops/dokploy.env.example
+          -f docker-compose.dokploy.yml
+          config --quiet
+
+  # ---------------------------------------------------------------------------
+  # 6) Dependency audit — fail on security vulnerabilities (high severity).
+  #
+  # `cargo audit` (no flags) exits non-zero ONLY on actual vulnerability
+  # advisories (RUSTSEC vulns) — i.e. the high-severity class — while
+  # unmaintained / yanked / notice advisories are reported as warnings and do
+  # NOT fail the job. That default is exactly "fail on high severity": a real
+  # vuln red-bars the build, a transitive unmaintained crate does not.
+  #
+  # We deliberately do NOT pass `--deny warnings` (that would promote
+  # unmaintained/yanked notices to hard errors and make the job flaky against
+  # the advisory DB). If you later want to formally ignore a specific advisory,
+  # add it to a committed `audit.toml` ([advisories] ignore = ["RUSTSEC-..."]).
+  # ---------------------------------------------------------------------------
+  audit:
+    name: cargo audit (fail on vulns)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit

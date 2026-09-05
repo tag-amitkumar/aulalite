@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">AulaLite mark</title>
+  <desc id="desc">A serif monogram A as an academy peak with a gold lectern bar and a live indicator.</desc>
+  <defs>
+    <linearGradient id="aula-emblem" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6552"/>
+      <stop offset="1" stop-color="#10251f"/>
+    </linearGradient>
+    <linearGradient id="aula-gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e7cf99"/>
+      <stop offset="1" stop-color="#b08842"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="90" height="90" rx="22" fill="url(#aula-emblem)"/>
+  <rect x="3.75" y="3.75" width="88.5" height="88.5" rx="21.25" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="1.5"/>
+  <rect x="7" y="7" width="82" height="82" rx="18" fill="none" stroke="url(#aula-gold)" stroke-opacity="0.55" stroke-width="1.5"/>
+  <path d="M48 23.5 70.5 74 H60.7 L48 44 L35.3 74 H25.5 Z" fill="#f7efe0"/>
+  <rect x="36.5" y="59.5" width="23" height="6" rx="3" fill="url(#aula-gold)"/>
+  <circle cx="70" cy="26" r="6" fill="#b8324a"/>
+  <circle cx="70" cy="26" r="6" fill="none" stroke="#f7efe0" stroke-opacity="0.9" stroke-width="2"/>
+</svg>

@@ -1,0 +1,18 @@
+# Local dev override (auto-loaded by a bare `docker compose ...`).
+#
+# Host port 8080 is occupied by an EnterpriseDB instance on this machine, so the
+# backend is exposed on 18080 instead. The frontend nginx still reaches the
+# backend via the internal docker network (backend:8080), so this only changes
+# direct-from-host access (used for backend testing). Backend health from the
+# host: curl http://localhost:18080/healthz. Frontend: http://localhost:3000.
+#
+# dioxus-kinetics is now a PUBLIC dependency fetched anonymously, so the old
+# gh_token BuildKit-secret wiring is gone — a bare `docker compose up -d --build`
+# needs no GH_TOKEN / env setup.
+#
+# PRODUCTION must NOT load this file. Deploy with an explicit file list:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+services:
+  backend:
+    ports: !override
+      - "18080:8080"

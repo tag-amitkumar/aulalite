@@ -1,0 +1,9 @@
+[application]
+name = "aulalite-web"
+default_platform = "web"
+
+[web.app]
+title = "AulaLite"
+
+[web.watcher]
+reload_html = true

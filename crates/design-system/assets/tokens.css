@@ -1,0 +1,412 @@
+:root {
+  /* ---- Brand chromatic ramps (Plan A v2) ---- */
+  --color-green-50:  #f0f5f3;
+  --color-green-100: #dbe7df;
+  --color-green-200: #b5cfc3;
+  --color-green-300: #82a89a;
+  --color-green-400: #588175;
+  --color-green-500: #386658;
+  --color-green-600: #244f43;
+  --color-green-700: #18372f;
+  --color-green-800: #10251f;
+  --color-green-900: #0a1812;
+  --color-green-950: #050d09;
+
+  --color-gold-50:  #fdfaf4;
+  --color-gold-100: #efe1bf;
+  --color-gold-200: #e5cf99;
+  --color-gold-300: #d8b975;
+  --color-gold-400: #cda35a;
+  --color-gold-500: #c9a45c;
+  --color-gold-600: #b08842;
+  --color-gold-700: #8d6c2f;
+  --color-gold-800: #6c5224;
+  --color-gold-900: #4d3a19;
+  --color-gold-950: #2e2210;
+
+  --color-navy-50:  #f2f5f8;
+  --color-navy-100: #d5dee5;
+  --color-navy-200: #b8c6d2;
+  --color-navy-300: #8ba1b5;
+  --color-navy-400: #5a7894;
+  --color-navy-500: #34546e;
+  --color-navy-600: #1d3144;
+  --color-navy-700: #142235;
+  --color-navy-800: #0d172a;
+  --color-navy-900: #060f1f;
+  --color-navy-950: #020611;
+
+  --color-oxblood-50:  #fbf3f5;
+  --color-oxblood-100: #f7e3e8;
+  --color-oxblood-200: #ebbac5;
+  --color-oxblood-300: #de8a9c;
+  --color-oxblood-400: #c45a71;
+  --color-oxblood-500: #b8324a;
+  --color-oxblood-600: #8f243d;
+  --color-oxblood-700: #6f1c30;
+  --color-oxblood-800: #531425;
+  --color-oxblood-900: #380c1a;
+  --color-oxblood-950: #20070f;
+
+  /* ---- Semantic ramps ---- */
+  --color-info-50:  #f0f5f9;
+  --color-info-100: #d9e6f0;
+  --color-info-200: #b6cee0;
+  --color-info-300: #82adc8;
+  --color-info-400: #4f86ac;
+  --color-info-500: #2d5f88;
+  --color-info-600: #20486d;
+  --color-info-700: #173657;
+  --color-info-800: #102742;
+  --color-info-900: #0a1a2d;
+  --color-info-950: #050f1a;
+
+  --color-success-50:  #f0f6f2;
+  --color-success-100: #dbe9df;
+  --color-success-200: #b6d3bf;
+  --color-success-300: #87b596;
+  --color-success-400: #589570;
+  --color-success-500: #2f6b45;
+  --color-success-600: #25553a;
+  --color-success-700: #1c402d;
+  --color-success-800: #142d21;
+  --color-success-900: #0c1c14;
+  --color-success-950: #06100a;
+
+  --color-warning-50:  #fbf6ec;
+  --color-warning-100: #f4ead6;
+  --color-warning-200: #e7d3aa;
+  --color-warning-300: #d7b577;
+  --color-warning-400: #c19549;
+  --color-warning-500: #9b6a1e;
+  --color-warning-600: #7f5418;
+  --color-warning-700: #623f12;
+  --color-warning-800: #482e0e;
+  --color-warning-900: #2e1d09;
+  --color-warning-950: #1a1005;
+
+  --color-danger-50:  #fbf0ef;
+  --color-danger-100: #f3d7d5;
+  --color-danger-200: #e5aba6;
+  --color-danger-300: #d27a74;
+  --color-danger-400: #ba514b;
+  --color-danger-500: #a33a36;
+  --color-danger-600: #832d2a;
+  --color-danger-700: #63221f;
+  --color-danger-800: #481917;
+  --color-danger-900: #2d0f0e;
+  --color-danger-950: #190706;
+
+  /* ---- Neutral / surface ramp (anchored on warm cream) ---- */
+  --color-neutral-50:  #fffdf8;
+  --color-neutral-100: #faf4e8;
+  --color-neutral-200: #efe6d2;
+  --color-neutral-300: #d8c9aa;
+  --color-neutral-400: #b8a880;
+  --color-neutral-500: #8d7f5c;
+  --color-neutral-600: #6d6558;
+  --color-neutral-700: #4a4538;
+  --color-neutral-800: #2c2920;
+  --color-neutral-900: #171a17;
+  --color-neutral-950: #0c0e0b;
+
+  /* Semantic aliases — forward to ramps; preserved for ergonomic component CSS */
+  --color-primary: var(--color-green-600);
+  --color-primary-hover: var(--color-green-700);
+  --color-accent: var(--color-green-600);
+  --color-accent-strong: var(--color-green-800);
+  --color-accent-soft: var(--color-green-100);
+  --color-navy: var(--color-navy-600);
+  --color-gold: var(--color-gold-500);
+  --color-gold-soft: var(--color-gold-100);
+  --color-oxblood: var(--color-oxblood-600);
+  --color-live: var(--color-oxblood-500);
+
+  /* Semantic aliases — forward to ramps */
+  --color-info: var(--color-info-500);
+  --color-success: var(--color-success-500);
+  --color-warning: var(--color-warning-500);
+  --color-danger: var(--color-danger-500);
+
+  /* Surface aliases — anchors preserved; muted aliases forward to neutral ramp */
+  --color-paper: #f6f0e6;
+  --color-paper-warm: var(--color-neutral-100);
+  --color-surface: #fffdf7;
+  --color-surface-subtle: #f3eadb;
+  --color-ink: var(--color-neutral-900);
+  --color-text: #171a17;
+  --color-text-muted: var(--color-neutral-600);
+  --color-rule: rgba(18, 22, 20, 0.13);
+  --color-rule-strong: rgba(18, 22, 20, 0.25);
+  /* Opaque focus color maintains 3:1 non-text contrast on cream surfaces. */
+  --color-focus: #765019;
+
+  /* Surface ink / stage tokens (Plan E) — anchors for dark-mode flipping */
+  --color-ink-sidebar: #162822;
+  --color-ink-stage: #101815;
+  --color-ink-stage-deep: #050706;
+  --color-on-ink-strong: rgba(255, 255, 255, 0.78);
+  --color-on-ink-subtle: rgba(255, 255, 255, 0.08);
+  --color-banner-warm: #f4ead6;
+  --color-banner-warm-border: rgba(155, 106, 30, 0.24);
+  --color-state-error-bg: #fbebe8;
+  --color-state-error-border: rgba(163, 58, 54, 0.28);
+
+  /* ---- Spacing: 4px base, extended ---- */
+  --space-0: 0;
+  --space-px: 1px;
+  --space-0_5: 2px;
+  --space-1: 4px;
+  --space-1_5: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 40px;
+  --space-8: 56px;
+  --space-9: 72px;
+  --space-10: 96px;
+  --space-12: 128px;
+
+  /* ---- Type scale ---- */
+  --text-xs: 12px;       --leading-xs: 16px;
+  --text-sm: 13px;       --leading-sm: 18px;
+  --text-base: 14px;     --leading-base: 20px;
+  --text-md: 15px;       --leading-md: 22px;
+  --text-lg: 16px;       --leading-lg: 24px;
+  --text-xl: 18px;       --leading-xl: 26px;
+  --text-2xl: 20px;      --leading-2xl: 28px;
+  --text-3xl: 24px;      --leading-3xl: 32px;
+  --text-4xl: 30px;      --leading-4xl: 36px;
+  --text-5xl: 36px;      --leading-5xl: 40px;
+  --text-6xl: 48px;      --leading-6xl: 52px;
+  --text-7xl: 60px;      --leading-7xl: 64px;
+
+  /* ---- Radius scale ---- */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 24px;
+  --radius-full: 9999px;
+
+  --font-display: "Source Serif 4", "ui-serif", Georgia, "Times New Roman", serif;
+  --font-body: "Inter", "ui-sans-serif", "Segoe UI", Roboto, Arial, sans-serif;
+  --font-mono: "Cascadia Code", "Consolas", monospace;
+
+  /* ---- Elevation / shadows (soft, layered) ---- */
+  --shadow-xs: 0 1px 2px rgba(18, 22, 20, 0.04);
+  --shadow-sm: 0 1px 3px rgba(18, 22, 20, 0.06), 0 1px 2px rgba(18, 22, 20, 0.04);
+  --shadow-md: 0 4px 12px rgba(18, 22, 20, 0.08), 0 2px 4px rgba(18, 22, 20, 0.04);
+  --shadow-lg: 0 16px 32px rgba(18, 22, 20, 0.10), 0 6px 12px rgba(18, 22, 20, 0.06);
+  --shadow-xl: 0 30px 60px rgba(18, 22, 20, 0.14), 0 12px 24px rgba(18, 22, 20, 0.08);
+  --shadow-2xl: 0 50px 100px rgba(18, 22, 20, 0.20), 0 20px 40px rgba(18, 22, 20, 0.12);
+  --shadow-gold: 0 18px 44px rgba(201, 164, 92, 0.18);
+
+  /* ---- Motion: durations + cubic-bezier eases ---- */
+  --duration-fast: 120ms;
+  --duration-medium: 200ms;
+  --duration-slow: 320ms;
+  --duration-page-in: 420ms;
+
+  --ease-snappy: cubic-bezier(.4, 0, .2, 1);
+  --ease-decelerate: cubic-bezier(0, 0, .2, 1);
+  --ease-accelerate: cubic-bezier(.4, 0, 1, 1);
+  --ease-spring: cubic-bezier(.34, 1.56, .64, 1);
+  --ease-page-in: cubic-bezier(.2, .8, .2, 1);
+
+  /* Legacy aliases retained until Plan B migrates references */
+  --motion-fast: var(--duration-fast) var(--ease-snappy);
+  --motion-medium: var(--duration-medium) var(--ease-snappy);
+  --motion-page: var(--duration-page-in) var(--ease-page-in);
+
+  /* ---- Live-session stage z-index scale (single-sourced, replaces magic 5s) */
+  --z-stage: 0;
+  --z-reactions: 20;
+  --z-pip: 30;
+  --z-pip-toggle: 31;
+  --z-stage-toast: 40;
+
+  /* ===========================================================
+   * Design System v1 — shadcn-feel-on-warm-cream (2026-05-17)
+   * Additive only. Existing tokens above are unchanged.
+   * =========================================================== */
+
+  /* Control sizing (tight density) */
+  --control-h-sm: 28px;
+  --control-h-md: 36px;
+  --control-h-lg: 44px;
+  --control-px-sm: 8px;
+  --control-px-md: 12px;
+  --control-px-lg: 16px;
+  --control-gap: 6px;
+
+  /* Radius (unified, shadcn-style). Legacy --radius-* aliases retained above. */
+  --radius: 8px;
+  --radius-shadcn-sm: calc(var(--radius) - 4px); /* 4px  */
+  --radius-shadcn-md: calc(var(--radius) - 2px); /* 6px  */
+  --radius-shadcn-lg: var(--radius);             /* 8px  */
+  --radius-shadcn-xl: calc(var(--radius) + 4px); /* 12px */
+
+  /* Ring (focus) — gold-tinted custom touch */
+  --ring:        0 0 0 2px var(--color-surface),
+                 0 0 0 4px var(--color-focus);
+  --ring-danger: 0 0 0 2px var(--color-surface),
+                 0 0 0 4px rgba(163, 58, 54, 0.55);
+  --ring-offset: var(--color-surface);
+
+  /* Shadows — flatter shadcn-leaning defaults + warm hover + paper-press */
+  --shadow-flat:       0 1px 0 rgba(18, 22, 20, 0.04),
+                       0 0 0 1px var(--color-rule);
+  --shadow-press:      inset 0 1px 2px rgba(18, 22, 20, 0.10);
+  --shadow-warm-hover: 0 6px 18px rgba(201, 164, 92, 0.10),
+                       0 1px 0 rgba(18, 22, 20, 0.04),
+                       0 0 0 1px var(--color-rule);
+
+  /* Motion timing — entrance/exit pair (shadcn / Radix style) */
+  --duration-enter: 180ms;
+  --duration-exit:  140ms;
+  --ease-content:   cubic-bezier(0.32, 0.72, 0, 1);
+  --press-y:        1px;
+
+  /* Surface tokens for new components */
+  --surface-card:       var(--color-surface);
+  --surface-card-hover: #fffaf0;
+  --surface-muted:      var(--color-surface-subtle);
+  --surface-overlay:    rgba(15, 17, 14, 0.45);
+  --surface-popover:    #fffdf7;
+
+  /* Brand / accent semantic remap (alias-only; values unchanged) */
+  --brand-primary:        var(--color-green-600);
+  --brand-primary-hover:  var(--color-green-700);
+  --brand-primary-active: var(--color-green-800);
+  --accent-premium:       var(--color-gold-500);
+  --accent-info:          var(--color-navy-600);
+  --accent-live:          var(--color-oxblood-500);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--color-paper);
+}
+
+body {
+  min-height: 100%;
+  margin: 0;
+  color: var(--color-text);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 247, 0.92), rgba(246, 240, 230, 0.96)),
+    radial-gradient(circle at 10% 0%, rgba(201, 164, 92, 0.18), transparent 34%),
+    var(--color-paper);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: var(--color-accent-strong);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  color: var(--color-navy);
+}
+
+/* ---- Dark theme: Elite Academy after hours ----
+ * Keyed on `data-ui-theme` (the dioxus-kinetics ThemeProvider attribute) so a
+ * single attribute on <html> drives both AulaLite token CSS and kinetics
+ * components. The attribute is always resolved to an explicit "light"/"dark"
+ * value (an inline boot script in index.html + the theme runtime handle the
+ * "system" preference), so no prefers-color-scheme media block is needed here.
+ * Only token overrides in this block — never component CSS. Raw chromatic
+ * ramps (green/gold/navy/…-N) are theme-invariant; only aliases flip.
+ */
+[data-ui-theme="dark"] {
+  color-scheme: dark;
+
+  /* Brand aliases — solid fills keep mid greens (white ink stays readable);
+   * text/link accents lighten to hold AA contrast on deep green-charcoal. */
+  --color-primary: var(--color-green-500);
+  --color-primary-hover: var(--color-green-400);
+  --color-accent: var(--color-green-400);
+  --color-accent-strong: var(--color-green-200);
+  --color-accent-soft: var(--color-green-800);
+  --color-navy: var(--color-navy-300);
+  --color-gold: var(--color-gold-500);
+  --color-gold-soft: var(--color-gold-900);
+  --color-oxblood: var(--color-oxblood-300);
+  --color-live: var(--color-oxblood-400);
+
+  --color-info: var(--color-info-400);
+  --color-success: var(--color-success-400);
+  --color-warning: var(--color-warning-400);
+  --color-danger: var(--color-danger-400);
+
+  /* Surfaces — deep green-charcoal paper, cream ink. */
+  --color-paper: #0e1512;
+  --color-paper-warm: #131c18;
+  --color-surface: #17221d;
+  --color-surface-subtle: #1d2a24;
+  --color-ink: var(--color-neutral-100);
+  --color-text: #f1ead9;
+  --color-text-muted: #ada48f;
+  --color-rule: rgba(241, 234, 217, 0.14);
+  --color-rule-strong: rgba(241, 234, 217, 0.26);
+  --color-focus: #e2c084;
+
+  --color-banner-warm: #271f12;
+  --color-banner-warm-border: rgba(201, 164, 92, 0.30);
+  --color-state-error-bg: #2c1614;
+  --color-state-error-border: rgba(210, 122, 116, 0.35);
+
+  /* Shadows — deeper, on true black. */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.30);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.36), 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.42), 0 2px 4px rgba(0, 0, 0, 0.30);
+  --shadow-lg: 0 16px 32px rgba(0, 0, 0, 0.48), 0 6px 12px rgba(0, 0, 0, 0.34);
+  --shadow-xl: 0 30px 60px rgba(0, 0, 0, 0.54), 0 12px 24px rgba(0, 0, 0, 0.38);
+  --shadow-2xl: 0 50px 100px rgba(0, 0, 0, 0.60), 0 20px 40px rgba(0, 0, 0, 0.42);
+  --shadow-gold: 0 18px 44px rgba(201, 164, 92, 0.12);
+  --shadow-press: inset 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-warm-hover: 0 6px 18px rgba(201, 164, 92, 0.08),
+                       0 1px 0 rgba(0, 0, 0, 0.30),
+                       0 0 0 1px var(--color-rule);
+
+  /* Design System v1 surface tokens */
+  --surface-card: var(--color-surface);
+  --surface-card-hover: #1b2721;
+  --surface-muted: var(--color-surface-subtle);
+  --surface-overlay: rgba(0, 0, 0, 0.62);
+  --surface-popover: #1a2620;
+
+  --brand-primary: var(--color-green-500);
+  --brand-primary-hover: var(--color-green-400);
+  --brand-primary-active: var(--color-green-600);
+  --accent-info: var(--color-navy-300);
+  --accent-live: var(--color-oxblood-400);
+}
+
+html[data-ui-theme="dark"] {
+  background: var(--color-paper);
+}
+
+html[data-ui-theme="dark"] body {
+  background:
+    linear-gradient(180deg, rgba(16, 24, 21, 0.94), rgba(14, 21, 18, 0.97)),
+    radial-gradient(circle at 10% 0%, rgba(201, 164, 92, 0.10), transparent 34%),
+    var(--color-paper);
+}

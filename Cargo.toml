@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-types",
+    "crates/api-client",
+    "crates/design-system",
+    "crates/platform-bridge",
+    "crates/features-auth",
+    "crates/features-courses",
+    "crates/shell-web",
+    "crates/shell-desktop",
+    "crates/shell-mobile",
+    "crates/backend",
+    "tools/aulalite-admin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "js", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "bigdecimal", "macros"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors", "set-header"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+dioxus = "=0.7.9"
+dioxus-router = "=0.7.9"
+async-trait = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = "1"
+serde_with = "3"
+base64 = "0.23"
+fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-keys", "i-hashes", "i-lists", "i-sets", "i-sorted-sets", "i-scripts", "enable-rustls-ring"] }
+rand = "0.9"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.11"
+sha1 = "0.10"
+hmac = "0.13"
+ring = "0.17"
+dioxus-free-icons = { version = "0.10", default-features = false, features = ["lucide"] }
+# dioxus-kinetics — semantic Dioxus UI library + glass materials + motion + AI surfaces.
+# Pinned by rev for reproducible builds. PUBLIC repo: the in-container build fetches
+# it anonymously (no credentials / BuildKit secret needed).
+# default-features=false drops the heavy `liquid-glass`/wgpu path; GlassSurface
+# falls back to its pure-CSS render which is what AulaLite uses.
+kinetics = { git = "https://github.com/ChiranjibChaudhuri/dioxus-kinetics.git", rev = "3fa9027f4e88d6b071c5e92581246ab98fab9c61", default-features = false, features = ["web", "tokens", "glass", "motion", "layout-motion", "a11y", "timeline", "runtime", "blocks", "learn"] }
+
+[profile.release]
+strip = "debuginfo"

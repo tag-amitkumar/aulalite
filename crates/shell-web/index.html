@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <title>{app_title}</title>
+        <meta content="text/html;charset=utf-8" http-equiv="Content-Type">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta charset="UTF-8">
+        <meta name="theme-color" content="#10251f">
+        <meta name="color-scheme" content="light dark">
+        <meta name="application-name" content="AulaLite">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-title" content="AulaLite">
+        <meta name="apple-mobile-web-app-status-bar-style" content="default">
+        <link rel="preload" as="font" type="font/woff2" crossorigin="anonymous"
+              href="/assets/fonts/Inter-Variable.woff2">
+        <link rel="preload" as="font" type="font/woff2" crossorigin="anonymous"
+              href="/assets/fonts/SourceSerif4-Variable.woff2">
+        <meta name="description" content="AulaLite is a premium live learning workspace for modern academies.">
+        <meta name="robots" content="index,follow,max-image-preview:large">
+        <meta property="og:type" content="website">
+        <meta property="og:site_name" content="AulaLite">
+        <meta property="og:title" content="AulaLite — Live learning, beautifully operated">
+        <meta property="og:description" content="Live classes, courses, assignments, attendance, and academy operations in one calm workspace.">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="AulaLite — Live learning, beautifully operated">
+        <meta name="twitter:description" content="Run live learning and academy operations from one calm workspace.">
+        <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/app-icon-32.png">
+        <link rel="icon" type="image/svg+xml" href="/assets/brand/aulalite-mark.svg">
+        <link rel="apple-touch-icon" sizes="256x256" href="/assets/brand/app-icon-256.png">
+        <link rel="manifest" href="/manifest.webmanifest">
+        <script src="/assets/app-bootstrap.js?v=__AULALITE_RUNTIME_CONFIG_VERSION__"></script>
+        <link rel="stylesheet" href="/assets/tokens.css">
+        <link rel="stylesheet" href="/assets/components.css">
+        <!-- Publishable Firebase/FCM settings are generated from container
+             environment variables at startup. The source placeholder remains
+             empty for direct `dx serve`, where local-login degrades gracefully.
+             The production entrypoint replaces the version token so the PWA's
+             cache-first asset worker cannot retain config from an old deploy. -->
+        <script src="/runtime-config.js?v=__AULALITE_RUNTIME_CONFIG_VERSION__"></script>
+        <script src="/assets/firebase-bridge.js"></script>
+        <script src="/assets/fcm-bridge.js"></script>
+        <!-- Background blur / virtual backgrounds for the live room. Sets
+             window.aula.blur synchronously and lazy-imports the vendored
+             MediaPipe ESM (/vendor/mediapipe) on first use. Absent assets
+             degrade to a no-op (raw camera publishes). -->
+        <script src="/assets/blur-bridge.js"></script>
+        <!-- Whiteboard PNG export (window.aula.exportWhiteboardPng). Absent → no-op. -->
+        <script src="/assets/whiteboard-bridge.js"></script>
+        <!-- SCORM 1.2/2004 runtime bridge: installs window.API / window.API_1484_11
+             and round-trips CMI through the backend. Configured by ScormPlayer via
+             window.__SCORM__ before the SCO iframe loads. -->
+        <script src="/assets/scorm-bridge.js"></script>
+        <!-- Tiny facade for specialist browser features. The 413 KB HLS player
+             is imported only when an HLS fallback surface actually mounts. -->
+        <script src="/assets/feature-loader.js"></script>
+        <!-- Landing-page motion loads its self-hosted GSAP runtime only when
+             the anonymous product page is actually present. -->
+        <script defer src="/assets/marketing-motion.js"></script>
+    </head>
+    <body>
+        <div id="main"></div>
+        <noscript>
+            <main>
+                <h1>AulaLite needs JavaScript</h1>
+                <p>Enable JavaScript in this browser, then reload to sign in and continue learning.</p>
+            </main>
+        </noscript>
+    </body>
+</html>

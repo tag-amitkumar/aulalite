@@ -1,0 +1,18 @@
+# tools/aulalite-admin/Cargo.toml
+[package]
+name = "aulalite-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aulalite-admin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

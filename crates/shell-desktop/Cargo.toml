@@ -1,0 +1,18 @@
+# crates/shell-desktop/Cargo.toml
+[package]
+name = "shell-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Release bundles enable this to suppress the extra console window on Windows.
+bundle = []
+
+[dependencies]
+dioxus = { workspace = true, features = ["desktop"] }
+shell-web = { path = "../shell-web", default-features = false }
+platform-bridge = { path = "../platform-bridge" }
+dotenvy = { workspace = true }

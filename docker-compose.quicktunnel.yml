@@ -1,0 +1,40 @@
+# Quick-tunnel overlay: points the app's public-origin variables at the
+# ephemeral *.trycloudflare.com hostname while leaving every port mapping
+# from docker-compose.yml + docker-compose.override.yml untouched, so
+# localhost keeps working exactly as before.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.quicktunnel.yml --env-file .env \
+#     --env-file ops/cloudflare/quicktunnel.env up -d backend frontend
+services:
+  backend:
+    environment:
+      APP_ORIGIN: ${QT_URL}
+      API_ORIGIN: ${QT_URL}
+      # Both origins allowed so the public URL and localhost:3000 both work.
+      # API calls are same-origin through the nginx /v1 proxy either way, so
+      # this only matters for any cross-origin edge.
+      AULALITE_BROWSER_ORIGINS: ${QT_URL},http://localhost:3000
+      STRIPE_SUCCESS_URL: ${QT_URL}/admin/billing?status=success
+      STRIPE_CANCEL_URL: ${QT_URL}/admin/billing?status=cancel
+      MEDIAMTX_PUBLIC_HLS_URL: ${QT_HLS_URL}
+      MEDIAMTX_PUBLIC_WEBRTC_URL: ${QT_WEBRTC_URL}
+  frontend:
+    environment:
+      AULALITE_API_BASE_URL: ""
+      AULALITE_APP_ORIGIN: ${QT_URL}
+    # (appended) media plane over HTTPS so an HTTPS page never requests
+    # an http:// media URL — that would be blocked as mixed content.
+  mediamtx:
+    environment:
+      MTX_WEBRTCALLOWORIGINS: ${QT_URL}
+      MTX_HLSALLOWORIGINS: ${QT_URL}
+      # MediaMTX must gather relay candidates too. The browser having a TURN
+      # candidate is not enough: MediaMTX sits behind the same NAT and would
+      # otherwise only offer 127.0.0.1, so the two peers could never meet.
+      # With both sides pointed at the same relay, media flows over TCP/443
+      # and needs no inbound UDP port. MediaMTX maps list-of-struct config to
+      # MTX_<KEY>_<INDEX>_<FIELD>.
+      MTX_WEBRTCICESERVERS2_0_URL: ${AULALITE_TURN_URL}
+      MTX_WEBRTCICESERVERS2_0_USERNAME: ${AULALITE_TURN_USERNAME}
+      MTX_WEBRTCICESERVERS2_0_PASSWORD: ${AULALITE_TURN_CREDENTIAL}

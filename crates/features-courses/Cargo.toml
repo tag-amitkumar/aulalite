@@ -1,0 +1,81 @@
+[package]
+name = "features-courses"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dioxus = { workspace = true }
+dioxus-router = { workspace = true }
+core-types = { path = "../core-types" }
+design-system = { path = "../design-system" }
+api-client = { path = "../api-client" }
+platform-bridge = { path = "../platform-bridge" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+pulldown-cmark = { workspace = true }
+urlencoding = "2"
+url = "2"
+tracing = { workspace = true }
+base64 = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+futures-channel = "0.3"
+web-sys = { version = "0.3", features = [
+    # Phase 1b-α (preserved):
+    "Window","Location","Storage","Request","RequestInit","Response","Headers",
+    "File","FileList","HtmlInputElement",
+    "XmlHttpRequest","XmlHttpRequestUpload",
+    "ProgressEvent","Event",
+    # Phase 1b-β (WebRTC + media-devices):
+    "RtcPeerConnection","RtcConfiguration","RtcSessionDescription","RtcSessionDescriptionInit",
+    "RtcSdpType","RtcIceCandidate","RtcIceCandidateInit","RtcOfferOptions","RtcIceServer",
+    # ICE lifecycle (live_room_ice): web-sys gates every type behind a feature of
+    # the SAME NAME, and a method is gated on the features of the types in its
+    # signature -- so `ice_gathering_state()` needs "RtcIceGatheringState" and
+    # `connection_state()` needs "RtcPeerConnectionState". Omitting these is what
+    # produced the earlier E0433/E0599 ("could not find RtcIceGatheringState in
+    # web_sys"): a missing feature flag, not a missing API.
+    "RtcIceGatheringState","RtcPeerConnectionState","RtcIceConnectionState",
+    "RtcRtpTransceiver","RtcRtpTransceiverInit","RtcRtpTransceiverDirection","RtcRtpSender","RtcTrackEvent",
+    # RtcRtpSender::get_capabilities() returns Option<RtcRtpCapabilities>.
+    "RtcRtpCapabilities",
+    "RtcRtpEncodingParameters",
+    "MediaStream","MediaStreamTrack","MediaDevices","MediaStreamConstraints","DisplayMediaStreamConstraints",
+    "Navigator","HtmlVideoElement","HtmlMediaElement",
+    # Conferencing (Pillar 1): device picker, in-call camera switch, mic-level
+    # meter, and network-quality stats.
+    "MediaDeviceInfo","MediaDeviceKind","MediaTrackConstraints","RtcStatsReport",
+    "AudioContext","BaseAudioContext","AudioNode","AnalyserNode","MediaStreamAudioSourceNode",
+    # Phase 1b-β (live_room_view — DOM + console):
+    "Document","Element","console",
+    # Phase 1b-γ (live_room_socket — WebSocket):
+    "WebSocket","MessageEvent","CloseEvent","BinaryType",
+    # Command palette (Cmd-K): global document keydown listener.
+    "EventTarget","KeyboardEvent",
+    # Whiteboard: re-measure the canvas rect on window resize so stroke
+    # normalization stays correct after layout changes.
+    "DomRect",
+    # Whiteboard image paste/drop: pull the dropped/pasted image File out of the
+    # clipboard / drag DataTransfer and upload it via the presigned-upload path.
+    "ClipboardEvent","DragEvent","DataTransfer",
+    # Attendance CSV export: authenticated fetch -> Blob -> synthetic anchor download.
+    "Blob","Url","HtmlAnchorElement",
+] }
+
+# Native (desktop/mobile) HTTP path for api::fetch_json. Gated so the wasm
+# bundle is unaffected. Mirrors the workspace reqwest features (json + rustls-tls).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { workspace = true, features = ["stream"] }
+futures-util = "0.3"
+tokio = { workspace = true, features = ["time", "macros"] }
+
+[dev-dependencies]
+dioxus-ssr = "=0.7.10"

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 96" role="img" aria-labelledby="title desc">
+  <title id="title">AulaLite wordmark</title>
+  <desc id="desc">AulaLite — live learning academy — with the academy emblem.</desc>
+  <defs>
+    <linearGradient id="aw-emblem" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6552"/>
+      <stop offset="1" stop-color="#10251f"/>
+    </linearGradient>
+    <linearGradient id="aw-gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e7cf99"/>
+      <stop offset="1" stop-color="#b08842"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(2,11) scale(0.77)">
+    <rect x="3" y="3" width="90" height="90" rx="22" fill="url(#aw-emblem)"/>
+    <rect x="7" y="7" width="82" height="82" rx="18" fill="none" stroke="url(#aw-gold)" stroke-opacity="0.55" stroke-width="1.8"/>
+    <path d="M48 23.5 70.5 74 H60.7 L48 44 L35.3 74 H25.5 Z" fill="#f7efe0"/>
+    <rect x="36.5" y="59.5" width="23" height="6" rx="3" fill="url(#aw-gold)"/>
+    <circle cx="70" cy="26" r="6" fill="#b8324a"/>
+    <circle cx="70" cy="26" r="6" fill="none" stroke="#f7efe0" stroke-opacity="0.9" stroke-width="2"/>
+  </g>
+  <text x="92" y="52" font-family="'Source Serif 4', Georgia, 'Times New Roman', serif" font-size="42" font-weight="600" letter-spacing="-0.5" fill="#18372f">Aula<tspan fill="#b08842">Lite</tspan></text>
+  <text x="94" y="74" font-family="'Inter', 'Segoe UI', Arial, sans-serif" font-size="11.5" font-weight="600" letter-spacing="3.6" fill="#6d6558">LIVE LEARNING ACADEMY</text>
+</svg>

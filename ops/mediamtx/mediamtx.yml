@@ -1,0 +1,62 @@
+# Phase 1b-beta: HTTP-only auth (Pattern B).
+#
+# MediaMTX supports only ONE authMethod at a time. The running version
+# (confirmed via /v3/config/global/get) uses a single `authMethod` string
+# with separate `authHTTPAddress`/`authJWTJWKS` fields that are only active
+# when their respective authMethod is selected.
+#
+# Pattern A (authMethod: jwt globally + HTTP for publish) cannot be expressed
+# in a single MediaMTX config — authHTTPAddress is only consulted when
+# authMethod: http is active.
+#
+# Choice: authMethod: http for everything. The backend's
+# /v1/mediamtx/auth/publish endpoint validates:
+#   - action=publish  → nonce/Basic-auth issued at session-start
+#   - action=read     → viewer JWT (RS256) via JwtSigner::verify_viewer_jwt
+# JWT-read enforcement in the backend is deferred to a follow-up task.
+#
+# X-MediaMTX-Auth-Shared is forwarded from the MEDIAMTX_AUTH_SHARED_HEADER
+# env var (set in docker-compose.yml) to prevent unauthenticated external
+# callers from spoofing auth callbacks.
+
+logLevel: info
+
+authMethod: http
+authHTTPAddress: http://backend:8080/v1/mediamtx/auth/publish
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+api: yes
+apiAddress: :9997
+
+metrics: yes
+metricsAddress: :9998
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: no
+# Local Docker advertises 127.0.0.1 so a host browser can reach the published
+# UDP ICE listener (default :8189). Compose overrides this list through
+# MTX_WEBRTCADDITIONALHOSTS; production supplies the node's public IP or media
+# DNS hostname. Host networking is not required.
+webrtcAdditionalHosts: [127.0.0.1]
+
+hls: yes
+hlsAddress: :8888
+hlsEncryption: no
+hlsVariant: lowLatency
+
+# --- Recording defaults (fmp4 segments to shared volume) ---
+# MediaMTX v1.18.1+: recording keys live under pathDefaults (top-level record* are deprecated).
+pathDefaults:
+  record: yes
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 100ms
+  recordSegmentDuration: 30m
+  recordDeleteAfter: 24h
+
+paths:
+  all_others:

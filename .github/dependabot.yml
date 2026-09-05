@@ -1,0 +1,52 @@
+version: 2
+
+updates:
+  # Rust crates across the cargo workspace. Dependabot reads the root
+  # Cargo.toml/Cargo.lock and proposes updates for the whole workspace.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+      include: scope
+    labels:
+      - dependencies
+      - rust
+    groups:
+      # Batch low-risk minor/patch bumps into a single PR to cut review noise.
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Dioxus framework, router, SSR helpers, and CLI must move in lockstep.
+      # They are pinned at 0.7.9; bump them deliberately, not via Dependabot.
+      - dependency-name: dioxus
+      - dependency-name: dioxus-router
+    # `kinetics` is a git dependency pinned by rev in Cargo.toml — Dependabot's
+    # cargo updater intentionally does not touch git revs, so no rule is needed.
+
+  # GitHub Actions used in .github/workflows/.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-all:
+        patterns:
+          - "*"
