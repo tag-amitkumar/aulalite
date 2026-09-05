@@ -384,24 +384,32 @@ impl MediaMtxClient for HttpMediaMtxClient {
             }
         }
 
+        // Kick EVERY session before reporting a problem. Returning on the first
+        // failure left the remaining publishers on the path running, which is
+        // the exact leak this function exists to prevent -- and the one that
+        // matters most is whichever session is still publishing.
+        let mut failures: Vec<String> = Vec::new();
         for id in ids {
             let url = format!("{}/v3/webrtcsessions/kick/{}", self.base_url, id);
-            let resp = self
-                .http
-                .post(&url)
-                .send()
-                .await
-                .map_err(|e| MediaMtxError::Transport(e.to_string()))?;
+            let resp = match self.http.post(&url).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    failures.push(format!("{id}: {e}"));
+                    continue;
+                }
+            };
             // A session that ended between the list and the kick is already
             // gone -- exactly the outcome we wanted.
             if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
-                return Err(MediaMtxError::Api(format!(
-                    "kick session {} on {}: {}",
-                    id,
-                    path,
-                    resp.status()
-                )));
+                failures.push(format!("{id}: {}", resp.status()));
             }
+        }
+        if !failures.is_empty() {
+            return Err(MediaMtxError::Api(format!(
+                "kick on {}: {}",
+                path,
+                failures.join(", ")
+            )));
         }
         Ok(())
     }

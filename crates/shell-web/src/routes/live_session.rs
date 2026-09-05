@@ -44,6 +44,14 @@ const LOBBY_POLL_MS: u32 = 5_000;
 /// Backoff after a transient failure, so a flaking backend is not hammered.
 const LOBBY_POLL_BACKOFF_MS: u32 = 15_000;
 
+/// Upper bound on how long a lobby keeps asking.
+///
+/// Without one, a tab left open on a class that never starts -- or on a session
+/// whose state string this build does not recognise, which `map_status` maps to
+/// `Scheduled` -- polls for as long as the tab lives. Two hours comfortably
+/// outlasts "the teacher is running late" while still terminating.
+const LOBBY_POLL_MAX_MS: u32 = 2 * 60 * 60 * 1_000;
+
 fn map_status(s: &str) -> SessionStatus {
     match s {
         "scheduled" => SessionStatus::Scheduled,
@@ -57,7 +65,6 @@ fn map_status(s: &str) -> SessionStatus {
 #[component]
 pub fn LiveSession(slug: String, session_id: String) -> Element {
     let nav = use_navigator();
-    let api = use_api();
     let user_ctx = use_user_context();
     let user_snap = user_ctx.read().clone();
 
@@ -92,12 +99,18 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
     let mut join_state: Signal<Option<Result<JoinResp, String>>> = use_signal(|| None);
     let session_id_for_poll = session_id.clone();
     let poll_role = caller_role.clone();
+    // Re-read the context on every attempt rather than capturing one value:
+    // a lobby wait can outlive the access token that was current at mount, and
+    // a frozen token would 401 and evict a student who was waiting perfectly
+    // happily.
+    let api_signal = use_context::<Signal<features_courses::api::ApiContext>>();
     use_future(move || {
-        let api = api.clone();
         let session_id = session_id_for_poll.clone();
         let poll_role = poll_role.clone();
         async move {
+            let mut waited_ms: u32 = 0;
             loop {
+                let api = api_signal.read().clone();
                 let attempt = fetch_json::<JoinResp>(
                     &api,
                     "POST",
@@ -112,6 +125,13 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
                             features_courses::should_poll_for_start(&poll_role, &map_status(&j.state));
                         join_state.set(Some(Ok(j)));
                         if !keep_waiting {
+                            return;
+                        }
+                        if waited_ms >= LOBBY_POLL_MAX_MS {
+                            #[cfg(target_arch = "wasm32")]
+                            web_sys::console::log_1(
+                                &"[live_session] lobby poll gave up: class never started".into(),
+                            );
                             return;
                         }
                         LOBBY_POLL_MS
@@ -139,6 +159,7 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
                     }
                 };
 
+                waited_ms = waited_ms.saturating_add(delay_ms);
                 #[cfg(target_arch = "wasm32")]
                 gloo_timers::future::TimeoutFuture::new(delay_ms).await;
                 #[cfg(not(target_arch = "wasm32"))]

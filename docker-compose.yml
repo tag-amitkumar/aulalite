@@ -292,7 +292,9 @@ services:
   # everything else straight to MediaMTX. See ops/mediamtx/hls-gateway.conf for
   # why it must not buffer.
   hls-gateway:
-    image: nginxinc/nginx-unprivileged:alpine
+    # Digest-pinned like every other image here, and to the SAME digest the
+    # frontend builder uses (crates/shell-web/Dockerfile). Bump deliberately.
+    image: nginxinc/nginx-unprivileged:alpine@sha256:85bcbc6b2edd325462560c597d784ecee415024f1c6a004e53ac5f202b8ca561
     restart: unless-stopped
     depends_on:
       - mediamtx

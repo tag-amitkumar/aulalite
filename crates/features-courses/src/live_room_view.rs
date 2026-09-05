@@ -1173,6 +1173,40 @@ async fn detach_student_unguarded(
     }
 }
 
+/// Owner of the WHEP viewer for the legacy (no session context) mount.
+///
+/// Exists only so the viewer is not dropped -- see the call site. Replacing an
+/// entry closes the previous viewer on a detached task, since `close()` is
+/// async and this is called from sync context.
+#[cfg(target_arch = "wasm32")]
+fn stash_legacy_main_viewer(viewer: crate::live_room_whep::WhepViewer) {
+    use std::cell::RefCell;
+    thread_local! {
+        static LEGACY_MAIN_VIEWER: RefCell<Option<crate::live_room_whep::WhepViewer>> =
+            const { RefCell::new(None) };
+    }
+    let previous = LEGACY_MAIN_VIEWER.with(|slot| slot.borrow_mut().replace(viewer));
+    if let Some(mut previous) = previous {
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = previous.close().await;
+        });
+    }
+}
+
+/// Attach the session's main remote stream to `#live-room-main-video`.
+#[cfg(target_arch = "wasm32")]
+fn wire_main_video(session_sig: Signal<crate::live_room_session::LiveRoomSession>) {
+    let stream = session_sig.read().main_remote_stream();
+    if let (Some(stream), Some(doc)) = (stream, web_sys::window().and_then(|w| w.document())) {
+        if let Some(el) = doc.get_element_by_id("live-room-main-video") {
+            use wasm_bindgen::JsCast;
+            if let Ok(media_el) = el.dyn_into::<web_sys::HtmlMediaElement>() {
+                media_el.set_src_object(Some(&stream));
+            }
+        }
+    }
+}
+
 fn reattach_main_whep(
     session: Option<Signal<crate::live_room_session::LiveRoomSession>>,
     url: &str,
@@ -1337,6 +1371,13 @@ fn render_webrtc(
                             .set(Some(format!("Couldn't connect to the video stream ({e})")));
                         return;
                     }
+                    // Wire the teacher's feed onto the element FIRST. The screen
+                    // probe below is speculative (the teacher is usually not
+                    // sharing) and still costs an ICE-gathering wait before its
+                    // expected 404, so attaching main after it delayed the only
+                    // picture the student actually came for.
+                    wire_main_video(session_sig);
+
                     if !screen_url.is_empty() {
                         let screen_attach =
                             attach_screen_unguarded(session_sig, &screen_url, &viewer_jwt).await;
@@ -1393,6 +1434,15 @@ fn render_webrtc(
                                 }
                             }
                         }
+                        // The viewer MUST outlive this arm. `Drop for WhepViewer`
+                        // stops every remote track, closes the peer connection
+                        // and DELETEs the resource, so letting it fall out of
+                        // scope here killed the stream the instant it was
+                        // attached. The session-owned path above hands the
+                        // viewer to the aggregate; this legacy path (no session
+                        // context -- SSR/tests) has no owner, so park it in a
+                        // module-local slot that also closes any predecessor.
+                        stash_legacy_main_viewer(viewer);
                     }
                     Err(e) => {
                         web_sys::console::error_1(&format!("WHEP failed: {e}").into());

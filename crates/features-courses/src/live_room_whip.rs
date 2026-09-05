@@ -1,4 +1,4 @@
-﻿// crates/features-courses/src/live_room_whip.rs
+// crates/features-courses/src/live_room_whip.rs
 //! WHIP (WebRTC HTTP Ingest) client. Posts an SDP offer to MediaMTX,
 //! receives an SDP answer, and streams local MediaStream tracks.
 //!
@@ -61,15 +61,15 @@ pub struct SimulcastTier {
 
 /// The default 3-layer simulcast ladder used for the main camera track.
 ///
-/// Ordered LOWâ†’HIGH because the spec (and Chrome) expects `sendEncodings`
+/// Ordered LOW→HIGH because the spec (and Chrome) expects `sendEncodings`
 /// ordered from the lowest-quality layer to the highest. The rids `q`/`h`/`f`
 /// (quarter / half / full) are the conventional libwebrtc names that MediaMTX
 /// and most SFUs recognise. Bitrate caps are conservative so a teacher on a
 /// modest uplink can still sustain all three layers:
 ///
-///   * `q` â€” 1/4 resolution, 150 kbps  (thumbnail / poor-network viewers)
-///   * `h` â€” 1/2 resolution, 500 kbps  (default for most viewers)
-///   * `f` â€” full resolution, 1.5 Mbps (full-screen / good-network viewers)
+///   * `q` — 1/4 resolution, 150 kbps  (thumbnail / poor-network viewers)
+///   * `h` — 1/2 resolution, 500 kbps  (default for most viewers)
+///   * `f` — full resolution, 1.5 Mbps (full-screen / good-network viewers)
 /// The video codec the SFU can actually remux, in `RTCRtpCodecCapability.mimeType`
 /// form (the comparison is case-insensitive).
 pub const PREFERRED_VIDEO_CODEC: &str = "video/H264";
@@ -335,14 +335,18 @@ mod imp {
         let cfg = rtc_config_with_stun();
         let pc = RtcPeerConnection::new_with_configuration(&cfg)
             .map_err(|e| format!("RtcPeerConnection: {e:?}"))?;
+        // Closes `pc` if any `?` below bails out. Until the WhipPublisher owns
+        // it, nothing else would, and an abandoned connection keeps its ICE
+        // agent and gathered ports alive for the life of the page.
+        let pc_guard = crate::live_room_ice::PcCloseGuard::new(pc.clone());
         let tracks = local_stream.get_tracks();
         for i in 0..tracks.length() {
             let track = tracks.get(i);
             let track: web_sys::MediaStreamTrack =
                 track.dyn_into().map_err(|_| "track cast".to_string())?;
-            // Video â†’ publish as a simulcast transceiver (multiple spatial
+            // Video → publish as a simulcast transceiver (multiple spatial
             // layers the SFU can forward selectively). Audio (and any future
-            // non-video kind) â†’ plain add_track, which is what it has always
+            // non-video kind) → plain add_track, which is what it has always
             // been. `add_video_with_simulcast` falls back to add_track_0 when
             // the browser/SFU can't take send_encodings, so video always flows.
             if track.kind() == "video" {
@@ -385,7 +389,7 @@ mod imp {
 
         // Typed read of the local description (per design Q1-C / typed SDP
         // section). `pc.local_description()` returns `Option<RtcSessionDescription>`
-        // and `.sdp()` is a typed accessor â€” no Reflect.get fallback needed.
+        // and `.sdp()` is a typed accessor — no Reflect.get fallback needed.
         let local_sdp = pc
             .local_description()
             .ok_or_else(|| "no local SDP".to_string())?
@@ -470,6 +474,10 @@ mod imp {
         // `404 no stream is available on path ...`. Verify the connection
         // really came up, and release the server-side session when it did not
         // so MediaMTX is not left holding a dead publisher.
+        // The publisher owns the connection from here: its close()/Drop handle
+        // teardown, including on the failure path just below.
+        pc_guard.disarm();
+
         if let Err(e) = crate::live_room_ice::await_connected(
             &publisher.pc,
             crate::live_room_ice::CONNECT_TIMEOUT_MS,
@@ -539,7 +547,7 @@ mod imp {
         ///   2. `RTCPeerConnection.close()` so the ICE / DTLS stack tears down.
         ///   3. `DELETE resource_url` so the WHIP server frees the session.
         ///
-        /// Idempotent â€” second call is a no-op. Errors during DELETE are
+        /// Idempotent — second call is a no-op. Errors during DELETE are
         /// downgraded to `Ok(())` because there is nothing meaningful the
         /// caller can do (we have already released the local resources).
         pub async fn close(&mut self) -> Result<(), String> {
@@ -581,7 +589,7 @@ mod imp {
     impl Drop for WhipPublisher {
         /// Best-effort cleanup on Drop. Stops local tracks and closes the PC
         /// synchronously, then spawns the async DELETE so the server learns
-        /// about the close. The spawned task is not awaited â€” if the page is
+        /// about the close. The spawned task is not awaited — if the page is
         /// closing the browser will cancel it, which is fine: the local
         /// resources are already released.
         fn drop(&mut self) {

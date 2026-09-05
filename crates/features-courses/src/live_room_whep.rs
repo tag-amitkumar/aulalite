@@ -99,6 +99,9 @@ mod imp {
         let cfg = rtc_config_with_stun();
         let pc = RtcPeerConnection::new_with_configuration(&cfg)
             .map_err(|e| format!("RtcPeerConnection: {e:?}"))?;
+        // See the matching guard in live_room_whip::publish: closes `pc` if any
+        // `?` below bails out before the WhepViewer takes ownership.
+        let pc_guard = crate::live_room_ice::PcCloseGuard::new(pc.clone());
 
         let remote_stream = MediaStream::new().map_err(|e| format!("MediaStream::new: {e:?}"))?;
 
@@ -254,6 +257,9 @@ mod imp {
         // video stream", so failing here is strictly better than handing back
         // a viewer whose media will never arrive. Release the server-side
         // egress session on failure.
+        // The viewer owns the connection from here.
+        pc_guard.disarm();
+
         if let Err(e) = crate::live_room_ice::await_connected(
             &viewer.pc,
             crate::live_room_ice::CONNECT_TIMEOUT_MS,

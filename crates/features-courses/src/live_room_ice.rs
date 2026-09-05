@@ -132,6 +132,57 @@ mod imp {
         });
     }
 
+    /// Keeps an event `Closure` alive for exactly as long as it is installed on
+    /// the peer connection, and uninstalls it on drop.
+    ///
+    /// Installing a handler and only clearing it after `rx.await` returns is
+    /// wrong: if the enclosing future is CANCELLED at that await -- which is
+    /// routine, the route can unmount mid-handshake -- the `Closure` is dropped
+    /// while the peer connection still holds a pointer to it, and the next
+    /// state change calls freed wasm memory. `Drop` runs before the fields are
+    /// dropped, so the handler is always uninstalled first.
+    struct InstalledHandler {
+        pc: RtcPeerConnection,
+        clear: fn(&RtcPeerConnection),
+        _cb: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for InstalledHandler {
+        fn drop(&mut self) {
+            (self.clear)(&self.pc);
+        }
+    }
+
+    /// Closes a peer connection if the function that created it bails out.
+    ///
+    /// Every `?` between `RtcPeerConnection::new_with_configuration` and the
+    /// point where the connection is handed to a `WhipPublisher`/`WhepViewer`
+    /// used to abandon an open connection: nothing owned it yet, so nothing
+    /// closed it, and the ICE agent and any gathered ports stayed alive until
+    /// the page went away. Disarm once ownership has been transferred.
+    pub struct PcCloseGuard {
+        pc: Option<RtcPeerConnection>,
+    }
+
+    impl PcCloseGuard {
+        pub fn new(pc: RtcPeerConnection) -> Self {
+            Self { pc: Some(pc) }
+        }
+
+        /// Ownership has moved to a type whose own `close`/`Drop` handles it.
+        pub fn disarm(mut self) {
+            let _ = self.pc.take();
+        }
+    }
+
+    impl Drop for PcCloseGuard {
+        fn drop(&mut self) {
+            if let Some(pc) = self.pc.take() {
+                pc.close();
+            }
+        }
+    }
+
     /// Wait until `pc` has gathered every ICE candidate it is going to gather,
     /// or `timeout_ms` elapses.
     ///
@@ -160,6 +211,13 @@ mod imp {
             })
         };
         pc.set_onicegatheringstatechange(Some(cb.as_ref().unchecked_ref()));
+        // Uninstalls on drop, so cancelling this future cannot leave the peer
+        // connection pointing at a freed closure.
+        let _installed = InstalledHandler {
+            pc: pc.clone(),
+            clear: |pc| pc.set_onicegatheringstatechange(None),
+            _cb: cb,
+        };
 
         // Re-check after attaching: `complete` can land between the early
         // return above and the handler being installed, and that transition
@@ -168,10 +226,7 @@ mod imp {
             fire(&slot, true);
         }
 
-        let completed = rx.await.unwrap_or(false);
-        pc.set_onicegatheringstatechange(None);
-        drop(cb);
-        completed
+        rx.await.unwrap_or(false)
     }
 
     /// Wait until `pc` reports `connectionState == "connected"`, or fail with a
@@ -214,6 +269,11 @@ mod imp {
             })
         };
         pc.set_onconnectionstatechange(Some(cb.as_ref().unchecked_ref()));
+        let _installed = InstalledHandler {
+            pc: pc.clone(),
+            clear: |pc| pc.set_onconnectionstatechange(None),
+            _cb: cb,
+        };
 
         // Same race as above: the state can advance while we are attaching.
         if let Some(done) = classify(pc.connection_state()) {
@@ -221,8 +281,6 @@ mod imp {
         }
 
         let outcome = rx.await.unwrap_or(None);
-        pc.set_onconnectionstatechange(None);
-        drop(cb);
 
         outcome.unwrap_or_else(|| {
             Err(format!(
