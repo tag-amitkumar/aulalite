@@ -327,6 +327,7 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
                 return;
             }
             publishing.set(true);
+            let mut state_for_auto = state_auto;
             let session_id = session_id_auto.clone();
             let session = session_auto;
             let self_stream = self_stream_auto;
@@ -334,7 +335,9 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
             // `peek` (non-subscribing) so a later background-FX change doesn't
             // re-run this auto-publish effect.
             let fx_mode = *blur_mode_auto.peek();
-            let publishing = publishing.clone();
+            // The task no longer clears `publishing` on failure -- it parks the
+            // room in PublishState::Error, and the effect's own `!is_live`
+            // branch resets the guard. So the task needs no handle on it.
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) = go_live_flow(
                     &session_id,
@@ -351,8 +354,30 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
                     web_sys::console::warn_1(
                         &format!("[live_room_broadcast] auto-publish on live failed: {e}").into(),
                     );
-                    // Allow a retry on the next render if it failed.
-                    publishing.set(false);
+                    // Park in a TERMINAL error state instead of clearing the
+                    // guard.
+                    //
+                    // Clearing `publishing` used to be harmless: publish()
+                    // returned Ok even when ICE never came up, so this arm was
+                    // only reached on a hard WHIP 4xx. Now that publish()
+                    // verifies the connection, the common real-world failure --
+                    // teacher and SFU on different networks with no working
+                    // TURN relay -- lands here every time. And because
+                    // `go_live_flow` also resets `self_stream` to None on
+                    // failure, both of this effect's guards would be clear on
+                    // the next render: it would re-acquire the camera, re-POST
+                    // /go-live, leave another MediaMTX session to time out, and
+                    // burn another CONNECT_TIMEOUT_MS, forever, while the UI
+                    // still claimed to be Live and the only trace was this
+                    // console line.
+                    //
+                    // PublishState::Error also drives the effect's own
+                    // `!is_live` branch, which clears `publishing` for us, so
+                    // the teacher's explicit retry still works. This mirrors
+                    // `reset_main_publish`, which parks at Idle for exactly
+                    // this reason ("so a denied permission does not enter a
+                    // retry loop").
+                    state_for_auto.set(PublishState::Error(e));
                 }
             });
         });

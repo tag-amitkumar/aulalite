@@ -321,20 +321,33 @@ impl LiveRoomSession {
         self.publisher.as_ref().map(|p| p.pc.clone())
     }
 
-    /// Student-side: subscribe to the teacher's WHEP feed.
+    /// Student-side: store the WHEP viewer for the teacher's feed, returning
+    /// the one it replaced so the CALLER can close it.
+    ///
+    /// Deliberately synchronous, and deliberately not an `attach_main` that
+    /// opens the viewer itself. A `Signal<LiveRoomSession>` write guard is
+    /// alive for the whole of `sig.write().method(..).await`, and the WHEP
+    /// handshake now legitimately takes tens of seconds (ICE gathering +
+    /// path-readiness retries + connection verification). Holding the guard
+    /// across that made any concurrent read/write of the same signal -- a
+    /// promoted student arriving on the socket, or route exit calling
+    /// `close()` -- a generational-box double borrow, which on wasm32
+    /// (`panic = "abort"`) traps the module instead of unwinding.
+    ///
+    /// The open-then-store split lives in `live_room_view::attach_main_unguarded`.
+    /// Returning the previous viewer keeps its async `close()` outside the
+    /// guard too.
+    ///
+    /// (MediaMTX's WHEP read-auth only accepts the join-minted viewer JWT, not
+    /// the backend API session token; passing the latter gave 403 -> 401 and a
+    /// blank student feed.)
     #[cfg(target_arch = "wasm32")]
-    pub async fn attach_main(&mut self, url: &str, viewer_jwt: &str) -> Result<(), String> {
-        // MediaMTX's WHEP read-auth only accepts the join-minted viewer JWT
-        // (signed by the viewer-JWT signer), NOT the backend API session token.
-        // Passing self.api.id_token here caused a 403 -> 401 ("WHEP returned 401")
-        // and a blank student feed.
-        let viewer = crate::live_room_whep::view(url, viewer_jwt).await?;
-        // Replace any prior viewer.
-        if let Some(mut prev) = self.viewer.take() {
-            let _ = prev.close().await;
-        }
-        self.viewer = Some(viewer);
-        Ok(())
+    #[must_use = "close the returned viewer outside the signal write guard"]
+    pub fn set_main_viewer(
+        &mut self,
+        viewer: crate::live_room_whep::WhepViewer,
+    ) -> Option<crate::live_room_whep::WhepViewer> {
+        self.viewer.replace(viewer)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -370,14 +383,16 @@ impl LiveRoomSession {
     /// (`screen WHEP inactive or unavailable`). So this uses `view_once` --
     /// a 404 means "not sharing" and must fail fast, not wait for a publisher
     /// that was never coming.
+    /// Store the screen-share viewer. Same guard discipline as
+    /// `set_main_viewer`; the open half is
+    /// `live_room_view::attach_screen_unguarded`, which uses `view_once`.
     #[cfg(target_arch = "wasm32")]
-    pub async fn attach_screen(&mut self, url: &str, viewer_jwt: &str) -> Result<(), String> {
-        let viewer = crate::live_room_whep::view_once(url, viewer_jwt).await?;
-        if let Some(mut prev) = self.screen_viewer.take() {
-            let _ = prev.close().await;
-        }
-        self.screen_viewer = Some(viewer);
-        Ok(())
+    #[must_use = "close the returned viewer outside the signal write guard"]
+    pub fn set_screen_viewer(
+        &mut self,
+        viewer: crate::live_room_whep::WhepViewer,
+    ) -> Option<crate::live_room_whep::WhepViewer> {
+        self.screen_viewer.replace(viewer)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -431,17 +446,13 @@ impl LiveRoomSession {
     /// top of the inner budget multiplied the worst-case wait, and it also
     /// retried terminal auth failures that cannot succeed.
     #[cfg(target_arch = "wasm32")]
-    pub async fn attach_student(
+    #[must_use = "close the returned viewer outside the signal write guard"]
+    pub fn set_student_viewer(
         &mut self,
         user_id: Uuid,
-        whep_url: &str,
-        viewer_jwt: &str,
-    ) -> Result<(), String> {
-        let viewer = crate::live_room_whep::view(whep_url, viewer_jwt).await?;
-        if let Some(mut prev) = self.students.insert(user_id, viewer) {
-            let _ = prev.close().await;
-        }
-        Ok(())
+        viewer: crate::live_room_whep::WhepViewer,
+    ) -> Option<crate::live_room_whep::WhepViewer> {
+        self.students.insert(user_id, viewer)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -464,10 +475,11 @@ impl LiveRoomSession {
 
     /// Drop a student WHEP viewer (e.g. when the student is demoted).
     #[cfg(target_arch = "wasm32")]
-    pub async fn detach_student(&mut self, user_id: Uuid) {
-        if let Some(mut v) = self.students.remove(&user_id) {
-            let _ = v.close().await;
-        }
+    /// Remove a student's viewer and hand it back for the caller to close
+    /// outside the write guard.
+    #[must_use = "close the returned viewer outside the signal write guard"]
+    pub fn take_student(&mut self, user_id: Uuid) -> Option<crate::live_room_whep::WhepViewer> {
+        self.students.remove(&user_id)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

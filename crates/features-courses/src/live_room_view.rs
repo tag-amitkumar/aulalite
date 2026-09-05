@@ -883,10 +883,10 @@ fn apply_event_to_state(
             // Every other participant watching the demoted student closes the
             // WHEP viewer they opened on `StudentPublishing`, so the audio/tile
             // stops cleanly instead of lingering as a dead peer connection.
-            if let Some(mut session_sig) = session {
+            if let Some(session_sig) = session {
                 if let Ok(parsed) = uuid::Uuid::parse_str(&user_id) {
                     spawn(async move {
-                        session_sig.write().detach_student(parsed).await;
+                        detach_student_unguarded(session_sig, parsed).await;
                     });
                 }
             }
@@ -912,7 +912,7 @@ fn apply_event_to_state(
             // open a WHEP subscription onto the promoted student's feed so
             // their tile appears in the strip without us having to manage a
             // viewer locally.
-            if let Some(mut session_sig) = session {
+            if let Some(session_sig) = session {
                 let uid = user_id.clone();
                 let viewer_jwt = viewer_jwt.clone();
                 // Prefer the server-supplied full WHEP URL (built from the
@@ -928,10 +928,8 @@ fn apply_event_to_state(
                 };
                 spawn(async move {
                     if let Ok(parsed) = uuid::Uuid::parse_str(&uid) {
-                        let _ = session_sig
-                            .write()
-                            .attach_student(parsed, &url, &viewer_jwt)
-                            .await;
+                        let _ =
+                            attach_student_unguarded(session_sig, parsed, &url, &viewer_jwt).await;
                     }
                 });
             }
@@ -1075,12 +1073,112 @@ async fn transient_banner_delay() {
 /// assigned, or the main-room feed on return / close), then wire the resulting
 /// remote stream onto the `#live-room-main-video` element. No-op when the
 /// session aggregate is absent (SSR) or `url` is empty.
+/// Attach the teacher's WHEP feed WITHOUT holding a `Signal` write guard
+/// across the handshake.
+///
+/// `sig.write().method(..).await` keeps the write guard alive for the whole
+/// statement, the await included. That was survivable while a WHEP subscribe
+/// returned in well under a second, but it now waits for ICE gathering, retries
+/// a 404 until MediaMTX marks the path readable, and verifies the connection --
+/// up to tens of seconds. Any concurrent touch of the same signal in that
+/// window (a `StudentPublishing` event attaching a promoted student, a
+/// `Demoted` event detaching one, or route exit awaiting `close()`) is then a
+/// generational-box double borrow. On wasm32 Rust builds with `panic = "abort"`,
+/// so that does not surface as a caught component panic -- the module traps and
+/// the room freezes.
+///
+/// So: open the viewer with NO guard, take a short synchronous write to store
+/// it, and close the viewer it replaced outside the guard as well.
+async fn attach_main_unguarded(
+    mut session: Signal<crate::live_room_session::LiveRoomSession>,
+    url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let viewer = crate::live_room_whep::view(url, viewer_jwt).await?;
+        let previous = session.write().set_main_viewer(viewer);
+        if let Some(mut previous) = previous {
+            let _ = previous.close().await;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Native keeps the media inside the WebView bridge, so there is no
+        // viewer object to store and the bridge call is short.
+        session.write().attach_main(url, viewer_jwt).await
+    }
+}
+
+/// Screen-share equivalent of [`attach_main_unguarded`]. Uses `view_once`: a
+/// 404 here means "the teacher is not sharing", which is the normal case.
+async fn attach_screen_unguarded(
+    mut session: Signal<crate::live_room_session::LiveRoomSession>,
+    url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let viewer = crate::live_room_whep::view_once(url, viewer_jwt).await?;
+        let previous = session.write().set_screen_viewer(viewer);
+        if let Some(mut previous) = previous {
+            let _ = previous.close().await;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        session.write().attach_screen(url, viewer_jwt).await
+    }
+}
+
+/// Promoted-student equivalent of [`attach_main_unguarded`].
+async fn attach_student_unguarded(
+    mut session: Signal<crate::live_room_session::LiveRoomSession>,
+    user_id: uuid::Uuid,
+    whep_url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let viewer = crate::live_room_whep::view(whep_url, viewer_jwt).await?;
+        let previous = session.write().set_student_viewer(user_id, viewer);
+        if let Some(mut previous) = previous {
+            let _ = previous.close().await;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        session.write().attach_student(user_id, whep_url, viewer_jwt).await
+    }
+}
+
+/// Detach a promoted student, closing their viewer outside the write guard.
+async fn detach_student_unguarded(
+    mut session: Signal<crate::live_room_session::LiveRoomSession>,
+    user_id: uuid::Uuid,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let previous = session.write().take_student(user_id);
+        if let Some(mut previous) = previous {
+            let _ = previous.close().await;
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        session.write().detach_student(user_id).await;
+    }
+}
+
 fn reattach_main_whep(
     session: Option<Signal<crate::live_room_session::LiveRoomSession>>,
     url: &str,
     viewer_jwt: &str,
 ) {
-    let Some(mut session_sig) = session else {
+    let Some(session_sig) = session else {
         return;
     };
     if url.is_empty() {
@@ -1089,7 +1187,7 @@ fn reattach_main_whep(
     let url = url.to_string();
     let viewer_jwt = viewer_jwt.to_string();
     spawn(async move {
-        if let Err(e) = session_sig.write().attach_main(&url, &viewer_jwt).await {
+        if let Err(e) = attach_main_unguarded(session_sig, &url, &viewer_jwt).await {
             #[cfg(target_arch = "wasm32")]
             web_sys::console::error_1(&format!("breakout re-attach_main failed: {e}").into());
             #[cfg(not(target_arch = "wasm32"))]
@@ -1228,13 +1326,11 @@ fn render_webrtc(
                 if main_url.is_empty() {
                     return;
                 }
-                if let Some(mut session_sig) = session {
+                if let Some(session_sig) = session {
                     // Session-owned path: attach_main stores the viewer
                     // inside the aggregate so route exit / Drop can close it.
-                    if let Err(e) = session_sig
-                        .write()
-                        .attach_main(&main_url, &viewer_jwt)
-                        .await
+                    if let Err(e) =
+                        attach_main_unguarded(session_sig, &main_url, &viewer_jwt).await
                     {
                         web_sys::console::error_1(&format!("attach_main failed: {e}").into());
                         video_error
@@ -1242,10 +1338,8 @@ fn render_webrtc(
                         return;
                     }
                     if !screen_url.is_empty() {
-                        let screen_attach = session_sig
-                            .write()
-                            .attach_screen(&screen_url, &viewer_jwt)
-                            .await;
+                        let screen_attach =
+                            attach_screen_unguarded(session_sig, &screen_url, &viewer_jwt).await;
                         match screen_attach {
                             Ok(()) => {
                                 let stream = session_sig.read().screen_remote_stream();
@@ -1388,7 +1482,7 @@ fn render_webrtc(
                             let viewer_jwt = retry_viewer_jwt.clone();
                             spawn(async move {
                                 let result = if let Some(mut session) = session {
-                                    session.write().attach_main(&main_url, &viewer_jwt).await
+                                    attach_main_unguarded(session, &main_url, &viewer_jwt).await
                                 } else {
                                     crate::live_room_native::view(
                                         crate::live_room_native::ViewRequest {
