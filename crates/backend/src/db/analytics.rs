@@ -172,17 +172,41 @@ pub async fn daily_activity(
         .await?;
 
     let rows = sqlx::query_as::<_, DailyActivityRow>(
+        // Half-open ranges over the STORED timestamp, not `<col>::date = d::date`.
+        //
+        // The cast form is not sargable: it applies a function to the indexed
+        // column, so every day scanned every tenant row of all four tables and
+        // cost grew as days x tenant_rows x 4. It also cannot be fixed with a
+        // matching expression index -- these columns are timestamptz and
+        // `timestamptz -> date` is STABLE, which Postgres refuses in an index
+        // expression ("functions in index expression must be marked IMMUTABLE").
+        //
+        // `<col> >= D AND <col> < D+1` selects exactly the same rows: the cast
+        // equality holds precisely when the value lies in [midnight D, midnight
+        // D+1), and `d::date::timestamptz` resolves that midnight in the same
+        // session time zone the cast would have used, so the day bucketing is
+        // unchanged. Being a range over the raw column, it seeks the
+        // (tenant_id, <col>) indexes from
+        // 20260906000087_analytics_daily_activity_indexes.
         "SELECT d::date AS day,
             (SELECT count(*) FROM live_sessions s
-              WHERE s.tenant_id = $1 AND s.starts_at::date = d::date) AS sessions,
+              WHERE s.tenant_id = $1
+                AND s.starts_at >= d::date::timestamptz
+                AND s.starts_at <  (d::date + 1)::timestamptz) AS sessions,
             (SELECT count(*) FROM attendance a
-              WHERE a.tenant_id = $1 AND a.first_joined_at::date = d::date)
+              WHERE a.tenant_id = $1
+                AND a.first_joined_at >= d::date::timestamptz
+                AND a.first_joined_at <  (d::date + 1)::timestamptz)
                 AS attendance_joins,
             (SELECT count(*) FROM submissions sub
-              WHERE sub.tenant_id = $1 AND sub.submitted_at::date = d::date)
+              WHERE sub.tenant_id = $1
+                AND sub.submitted_at >= d::date::timestamptz
+                AND sub.submitted_at <  (d::date + 1)::timestamptz)
                 AS submissions,
             (SELECT count(*) FROM lesson_completions lc
-              WHERE lc.tenant_id = $1 AND lc.completed_at::date = d::date)
+              WHERE lc.tenant_id = $1
+                AND lc.completed_at >= d::date::timestamptz
+                AND lc.completed_at <  (d::date + 1)::timestamptz)
                 AS lessons_completed
          FROM generate_series(
             CURRENT_DATE - ($2::int - 1) * interval '1 day',
