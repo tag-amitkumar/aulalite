@@ -273,6 +273,42 @@ fn workspace_name(claims: &FirebaseClaims, email: &str) -> String {
     format!("{owner}'s academy")
 }
 
+/// Firebase UIDs exempted from the `email_verified` requirement.
+///
+/// Read once from `AUTH_UNVERIFIED_UID_ALLOWLIST` (comma-separated). Empty by
+/// default, which is the normal production posture.
+///
+/// WHY UIDs AND NOT EMAILS. The verification check is the only thing proving a
+/// caller owns the address they claim, and two paths hand out privileges from
+/// that address alone -- `accept_pending_for_email` (tenant role from an
+/// invitation) and `parent::accept_pending_for_email` (access to a child's
+/// record). With self-service signup open, an EMAIL allowlist -- or simply
+/// deleting the check -- would let anyone register a victim's address and
+/// inherit whatever was invited to it. A Firebase UID is minted by Firebase for
+/// an account that already exists and cannot be chosen by the caller, so
+/// exempting a UID grants nothing to anyone who does not already control that
+/// account.
+///
+/// This exists because these test accounts cannot complete email verification:
+/// the project has no Admin SDK credential to set `emailVerified`, and the
+/// original fixtures used `@example.test`, a reserved non-routable domain that
+/// can never receive the verification mail.
+static UNVERIFIED_UID_ALLOWLIST: std::sync::LazyLock<std::collections::HashSet<String>> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("AUTH_UNVERIFIED_UID_ALLOWLIST")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+
+/// Whether this Firebase UID may skip the verified-email requirement.
+fn uid_is_allowlisted(sub: &str) -> bool {
+    !sub.is_empty() && UNVERIFIED_UID_ALLOWLIST.contains(sub)
+}
+
 fn verified_email(claims: &FirebaseClaims) -> Result<&str, ProvisionError> {
     let email = claims
         .email
@@ -280,7 +316,7 @@ fn verified_email(claims: &FirebaseClaims) -> Result<&str, ProvisionError> {
         .map(str::trim)
         .filter(|email| !email.is_empty())
         .ok_or(ProvisionError::MissingEmail)?;
-    if claims.email_verified != Some(true) {
+    if claims.email_verified != Some(true) && !uid_is_allowlisted(&claims.sub) {
         return Err(ProvisionError::EmailNotVerified);
     }
     Ok(email)
@@ -304,6 +340,20 @@ mod tests {
             iat: 0,
             auth_time: None,
         }
+    }
+
+    #[test]
+    fn allowlist_is_empty_by_default_and_exempts_nobody() {
+        // The default posture: with no env var set, nothing is exempt. Guards
+        // against the allowlist silently becoming a blanket bypass.
+        assert!(
+            !super::uid_is_allowlisted("uid"),
+            "an unset allowlist must exempt nothing"
+        );
+        assert!(
+            !super::uid_is_allowlisted(""),
+            "an empty subject must never match, even if the list is misconfigured"
+        );
     }
 
     #[test]

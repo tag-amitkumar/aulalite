@@ -29,6 +29,28 @@ async fn main() -> anyhow::Result<()> {
     let is_production = backend::auth::local_login::is_production(&app_env);
     tracing::info!(%app_env, is_production, "resolved runtime environment");
 
+    // Surface any verified-email exemption loudly at boot. This weakens the one
+    // check proving a caller owns the address they claim, so it must never sit
+    // in an environment unnoticed. UIDs are logged, not emails: a UID is not a
+    // credential and identifies exactly which account is exempt.
+    {
+        let allowlist = std::env::var("AUTH_UNVERIFIED_UID_ALLOWLIST").unwrap_or_default();
+        let uids: Vec<&str> = allowlist
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        if !uids.is_empty() {
+            tracing::warn!(
+                count = uids.len(),
+                uids = %uids.join(","),
+                "AUTH_UNVERIFIED_UID_ALLOWLIST is set: these Firebase UIDs skip the \
+                 verified-email requirement. Intended for test accounts that cannot \
+                 receive verification mail. Clear this variable to restore the default."
+            );
+        }
+    }
+
     if is_production
         && !std::env::var("AULALITE_MFA_ENFORCE")
             .map(|value| {

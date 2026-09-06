@@ -97,6 +97,8 @@ services:
       # Schema changes use an owner-level connection; request traffic uses the
       # least-privileged DATABASE_URL role. Production requires both.
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
+      # Test-account exemption from the verified-email check. Empty by default.
+      AUTH_UNVERIFIED_UID_ALLOWLIST: ${AUTH_UNVERIFIED_UID_ALLOWLIST:-}
       DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-20}
       DB_MIN_CONNECTIONS: ${DB_MIN_CONNECTIONS:-0}
       DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-10}
