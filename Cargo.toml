@@ -47,7 +47,7 @@ aws-credential-types = "1"
 serde_with = "3"
 base64 = "0.23"
 fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-keys", "i-hashes", "i-lists", "i-sets", "i-sorted-sets", "i-scripts", "enable-rustls-ring"] }
-rand = "0.9"
+rand = "0.10"
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.11"
 sha1 = "0.10"
