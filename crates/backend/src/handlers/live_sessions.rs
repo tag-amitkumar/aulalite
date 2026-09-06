@@ -2194,6 +2194,9 @@ pub struct CourseRecordingListItem {
     pub duration_seconds: i32,
     pub processing_status: String,
     pub has_playback: bool,
+    /// `Some(false)` when the stored MP4 has no video stream, so the list can
+    /// mark it audio-only before anyone opens it. `None` = not probed.
+    pub has_video: Option<bool>,
 }
 
 async fn list_course_recordings_inner(
@@ -2235,6 +2238,7 @@ async fn list_course_recordings_inner(
             duration_seconds: r.duration_seconds,
             processing_status: r.processing_status,
             has_playback: r.file_asset_id.is_some(),
+            has_video: r.has_video,
         })
         .collect();
     Ok(Json(items))
@@ -4578,6 +4582,10 @@ pub struct RecordingDto {
     pub playback_url: Option<String>,
     pub course_title: String,
     pub instructor_user_id: Option<Uuid>,
+    /// `Some(false)` when the recording is audio-only. See the
+    /// `recordings.has_video` migration; `None` means it was never probed, and
+    /// the player then behaves exactly as it did before this field existed.
+    pub has_video: Option<bool>,
 }
 
 async fn recording_inner(
@@ -4659,6 +4667,7 @@ async fn recording_inner(
         playback_url,
         course_title: session.course_title,
         instructor_user_id: session.primary_teacher_id,
+        has_video: row.has_video,
     }))
 }
 
@@ -5013,6 +5022,9 @@ async fn recording_retry_inner(
         playback_url: None,
         course_title: session.course_title,
         instructor_user_id: session.primary_teacher_id,
+        // Reprocessing: the old answer no longer describes the file being
+        // rebuilt, and the new one is not known until the remux finishes.
+        has_video: None,
     }))
 }
 

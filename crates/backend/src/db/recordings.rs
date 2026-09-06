@@ -15,6 +15,9 @@ pub struct RecordingRow {
     pub processing_status: String,
     pub processing_error: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `Some(false)` means the produced MP4 has no video stream (see the
+    /// `recordings.has_video` migration). `None` means it has not been probed.
+    pub has_video: Option<bool>,
 }
 
 /// Inserts a `recordings` row with `processing_status='pending'`.
@@ -33,7 +36,7 @@ pub async fn insert_pending(
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (session_id) DO NOTHING
          RETURNING id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                   duration_seconds, processing_status, processing_error, created_at",
+                   duration_seconds, processing_status, processing_error, created_at, has_video",
     )
     .bind(tenant_id)
     .bind(session_id)
@@ -76,7 +79,7 @@ pub async fn claim_for_processing(
                 processing_updated_at = now()
           WHERE session_id = $1 AND processing_status = 'pending'
         RETURNING id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                  duration_seconds, processing_status, processing_error, created_at",
+                  duration_seconds, processing_status, processing_error, created_at, has_video",
     )
     .bind(session_id)
     .fetch_optional(&mut **tx)
@@ -96,7 +99,7 @@ pub async fn set_status(
                 processing_updated_at = now()
           WHERE id = $1
         RETURNING id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                  duration_seconds, processing_status, processing_error, created_at",
+                  duration_seconds, processing_status, processing_error, created_at, has_video",
     )
     .bind(id)
     .bind(status)
@@ -110,21 +113,24 @@ pub async fn mark_available(
     id: Uuid,
     file_asset_id: Uuid,
     duration_seconds: i32,
+    has_video: Option<bool>,
 ) -> sqlx::Result<Option<RecordingRow>> {
     sqlx::query_as::<_, RecordingRow>(
         "UPDATE recordings
             SET processing_status = 'available',
                 file_asset_id = $2,
                 duration_seconds = $3,
+                has_video = $4,
                 processing_error = NULL,
                 processing_updated_at = now()
           WHERE id = $1
         RETURNING id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                  duration_seconds, processing_status, processing_error, created_at",
+                  duration_seconds, processing_status, processing_error, created_at, has_video",
     )
     .bind(id)
     .bind(file_asset_id)
     .bind(duration_seconds)
+    .bind(has_video)
     .fetch_optional(&mut **tx)
     .await
 }
@@ -138,7 +144,7 @@ where
 {
     sqlx::query_as::<_, RecordingRow>(
         "SELECT id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                duration_seconds, processing_status, processing_error, created_at
+                duration_seconds, processing_status, processing_error, created_at, has_video
            FROM recordings
           WHERE session_id = $1",
     )
@@ -200,7 +206,7 @@ pub async fn list_orphaned_in_progress(
     let mut tx = super::begin_system_context(pool).await?;
     let rows = sqlx::query_as::<_, RecordingRow>(
         "SELECT id, tenant_id, session_id, file_asset_id, started_at, ended_at,
-                duration_seconds, processing_status, processing_error, created_at
+                duration_seconds, processing_status, processing_error, created_at, has_video
            FROM recordings
           WHERE processing_status IN ('remuxing','uploading')
             AND processing_updated_at < now() - $1::interval
@@ -260,6 +266,7 @@ pub struct CourseRecordingRow {
     pub duration_seconds: i32,
     pub processing_status: String,
     pub file_asset_id: Option<Uuid>,
+    pub has_video: Option<bool>,
 }
 
 pub async fn list_for_course<'e, E>(
@@ -278,7 +285,8 @@ where
                 r.ended_at,
                 r.duration_seconds,
                 r.processing_status,
-                r.file_asset_id
+                r.file_asset_id,
+                r.has_video
            FROM recordings r
            JOIN live_sessions s ON s.id = r.session_id
           WHERE s.course_id = $1

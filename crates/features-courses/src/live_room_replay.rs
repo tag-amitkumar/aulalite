@@ -22,6 +22,19 @@ pub struct RecordingDto {
     pub playback_url: Option<String>,
     pub course_title: String,
     pub instructor_user_id: Option<String>,
+    /// `Some(false)` when the stored MP4 has no video stream at all.
+    ///
+    /// Classes recorded before this app preferred H.264 were published as VP8,
+    /// which the MP4 muxer cannot carry through the `-c copy` remux, so the
+    /// video track was dropped and only Opus audio survived. Rendered as an
+    /// ordinary `<video>` those play sound over a black rectangle, which reads
+    /// as a broken player rather than a recording that never had a picture.
+    ///
+    /// `None` means "not probed" -- old rows before the backfill, or a probe
+    /// that failed -- and is deliberately treated as an ordinary recording so a
+    /// healthy one can never be mislabelled.
+    #[serde(default)]
+    pub has_video: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, PartialEq)]
@@ -212,28 +225,61 @@ fn render_available(props: &LiveRoomReplayProps, rec: &RecordingDto) -> Element 
     // navigate. Hidden when there's no URL (shouldn't happen for "available").
     let has_url = !url.is_empty();
     let is_teacher = props.is_teacher;
+    // Only an explicit `false` switches presentation. `None` (never probed)
+    // keeps the ordinary player, so an unprobed-but-fine recording is never
+    // labelled audio-only.
+    let audio_only = rec.has_video == Some(false);
+    let subtitle = props
+        .instructor_name
+        .clone()
+        .map(|n| format!("Recorded session · {n}"))
+        .unwrap_or_else(|| "Recorded session".to_string());
+    let subtitle = if audio_only {
+        format!("{subtitle} · Audio only")
+    } else {
+        subtitle
+    };
 
     rsx! {
         div { class: "live-room-replay motion-page",
             PageHeader {
                 kicker: "Replay".to_string(),
                 title: props.course_title.clone(),
-                subtitle: props
-                    .instructor_name
-                    .clone()
-                    .map(|n| format!("Recorded session · {n}"))
-                    .unwrap_or_else(|| "Recorded session".to_string()),
+                subtitle: subtitle,
                 variant: PageHeaderVariant::Hero,
                 as_tag: HeadingLevel::H2,
             }
             div { class: "live-room-replay-grid",
-                div { class: "replay-video-pane live-room-stage",
+                div {
+                    class: if audio_only {
+                        "replay-video-pane live-room-stage replay-video-pane--audio-only"
+                    } else {
+                        "replay-video-pane live-room-stage"
+                    },
+                    // Audio-only recordings keep the SAME <video> element and
+                    // the same id: it plays Opus-in-MP4 perfectly well, the
+                    // chapter/chat sync reads currentTime off this element, and
+                    // swapping in an <audio> tag would break both for no gain.
+                    // Only the surrounding presentation changes -- CSS collapses
+                    // the black picture area to the control strip, and this
+                    // panel explains why there is nothing to look at.
+                    if audio_only {
+                        div { class: "replay-audio-only-banner", role: "note",
+                            span { class: "replay-audio-only-banner__icon", "aria-hidden": "true", "🎧" }
+                            div {
+                                p { class: "replay-audio-only-banner__title", "Audio only" }
+                                p { class: "replay-audio-only-banner__detail",
+                                    "This class was recorded before the switch to H.264 video, so only the sound was saved. Playback, chapters and chat replay all work normally."
+                                }
+                            }
+                        }
+                    }
                     video {
                         id: "live-room-replay-video",
                         src: "{url}",
                         controls: true,
                         playsinline: true,
-                        class: "replay-video",
+                        class: if audio_only { "replay-video replay-video--audio-only" } else { "replay-video" },
                     }
                     if has_url {
                         div { class: "replay-video-actions",

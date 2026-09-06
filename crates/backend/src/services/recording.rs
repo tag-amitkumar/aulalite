@@ -81,6 +81,16 @@ pub trait RecorderTool: Send + Sync {
 
     /// Probe duration in seconds via ffprobe.
     async fn probe_duration_seconds(&self, path: &Path) -> Result<i32, RecorderError>;
+
+    /// Whether the produced MP4 actually carries a video stream.
+    ///
+    /// It usually does, but not always: `remux_to_mp4` runs `-c copy`, and the
+    /// MP4 muxer cannot carry every codec MediaMTX might have recorded. A VP8
+    /// publish (what this app produced before it started preferring H.264)
+    /// remuxes to an audio-only MP4 -- ffmpeg drops the track and still exits
+    /// 0, so nothing upstream notices. Recording the answer lets the UI say
+    /// "audio only" instead of showing a black rectangle that plays sound.
+    async fn probe_has_video_stream(&self, path: &Path) -> Result<bool, RecorderError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +100,9 @@ pub enum RecorderCall {
         output: PathBuf,
     },
     ProbeDuration {
+        path: PathBuf,
+    },
+    ProbeHasVideo {
         path: PathBuf,
     },
 }
@@ -102,6 +115,7 @@ pub enum RecorderCall {
 pub struct MockRecorderTool {
     pub calls: Arc<Mutex<Vec<RecorderCall>>>,
     pub duration_seconds: Arc<Mutex<i32>>,
+    pub has_video: Arc<Mutex<bool>>,
 }
 
 impl MockRecorderTool {
@@ -109,11 +123,16 @@ impl MockRecorderTool {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             duration_seconds: Arc::new(Mutex::new(60)),
+            has_video: Arc::new(Mutex::new(true)),
         }
     }
 
     pub fn set_duration_seconds(&self, s: i32) {
         *self.duration_seconds.lock().unwrap() = s;
+    }
+
+    pub fn set_has_video(&self, v: bool) {
+        *self.has_video.lock().unwrap() = v;
     }
 
     pub fn calls(&self) -> Vec<RecorderCall> {
@@ -142,6 +161,13 @@ impl RecorderTool for MockRecorderTool {
             path: path.to_path_buf(),
         });
         Ok(*self.duration_seconds.lock().unwrap())
+    }
+
+    async fn probe_has_video_stream(&self, path: &Path) -> Result<bool, RecorderError> {
+        self.record(RecorderCall::ProbeHasVideo {
+            path: path.to_path_buf(),
+        });
+        Ok(*self.has_video.lock().unwrap())
     }
 }
 
@@ -219,6 +245,31 @@ impl RecorderTool for RealFfmpegRecorder {
             .parse()
             .map_err(|e| RecorderError::FfprobeFailed(format!("parse duration: {e}")))?;
         Ok(secs.max(0.0).round() as i32)
+    }
+
+    async fn probe_has_video_stream(&self, path: &Path) -> Result<bool, RecorderError> {
+        // `-select_streams v` restricts the listing to video streams, so an
+        // audio-only file prints nothing at all and a file with video prints
+        // one codec name per stream. Checking for non-empty output is therefore
+        // the whole test -- no parsing, and no dependence on the codec name.
+        let output = tokio::process::Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("v")
+            .arg("-show_entries")
+            .arg("stream=codec_name")
+            .arg("-of")
+            .arg("default=nw=1:nk=1")
+            .arg(path)
+            .output()
+            .await
+            .map_err(|e| RecorderError::Io(format!("spawn ffprobe: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(RecorderError::FfprobeFailed(stderr.to_string()));
+        }
+        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
     }
 }
 
@@ -321,6 +372,22 @@ pub async fn process_one_session(
         Err(e) => {
             mark_failed(pool, row.id, tenant_id, &format!("ffprobe: {e}")).await;
             return Err(e);
+        }
+    };
+
+    // Step 5b: does the remuxed file actually have a picture in it?
+    //
+    // Non-fatal by design. A recording with sound but no video is still worth
+    // keeping and is exactly what we want to LABEL rather than reject, and a
+    // probe that fails should not throw away a finished upload. `None` means
+    // "not determined", which the UI renders as an ordinary recording -- so the
+    // worst case of a failed probe is the pre-existing behaviour, never a
+    // healthy recording mislabelled as audio-only.
+    let has_video = match recorder.probe_has_video_stream(&tmp_mp4).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(?e, ?session_id, "video-stream probe failed; leaving unknown");
+            None
         }
     };
 
@@ -435,7 +502,7 @@ pub async fn process_one_session(
         .execute(&mut *tx)
         .await
         .map_err(|e| RecorderError::Io(format!("insert file_asset: {e}")))?;
-        db_rec::mark_available(&mut tx, row.id, asset_id, duration)
+        db_rec::mark_available(&mut tx, row.id, asset_id, duration, has_video)
             .await
             .map_err(|e| RecorderError::Io(format!("mark_available: {e}")))?;
         crate::db::usage_limits::consume_recording_reservation(&mut tx, row.id)
@@ -775,6 +842,88 @@ mod tests {
             .unwrap();
         let dur = recorder.probe_duration_seconds(&out).await.unwrap();
         assert_eq!(dur, 120);
+    }
+
+    #[tokio::test]
+    async fn mock_recorder_reports_configured_video_presence() {
+        let recorder = MockRecorderTool::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.mp4");
+
+        // Default is "has video" -- the overwhelmingly common case, and the
+        // safe default if a caller forgets to configure it.
+        assert!(recorder.probe_has_video_stream(&out).await.unwrap());
+
+        recorder.set_has_video(false);
+        assert!(!recorder.probe_has_video_stream(&out).await.unwrap());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecorderCall::ProbeHasVideo { .. })),
+            "the probe must be observable so pipeline tests can assert it ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_ffprobe_distinguishes_audio_only_from_video() {
+        // Guards the actual contract the UI depends on: `-select_streams v`
+        // prints nothing for an audio-only file. Generates both files with
+        // ffmpeg so it tests the real tool, not a stubbed answer. Skipped where
+        // ffmpeg is unavailable so the suite stays runnable off the container.
+        if tokio::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: ffprobe not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let with_video = tmp.path().join("av.mp4");
+        let audio_only = tmp.path().join("a.mp4");
+
+        let gen = |args: Vec<String>| async move {
+            tokio::process::Command::new("ffmpeg")
+                .args(args)
+                .output()
+                .await
+                .expect("ffmpeg run")
+        };
+        gen(vec![
+            "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx264", "-c:a", "aac", "-shortest",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(std::iter::once(with_video.to_string_lossy().into_owned()))
+        .collect())
+        .await;
+        gen(vec![
+            "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "aac",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(std::iter::once(audio_only.to_string_lossy().into_owned()))
+        .collect())
+        .await;
+
+        let recorder = RealFfmpegRecorder::new();
+        if with_video.exists() {
+            assert!(
+                recorder.probe_has_video_stream(&with_video).await.unwrap(),
+                "a file with a video stream must probe true"
+            );
+        }
+        if audio_only.exists() {
+            assert!(
+                !recorder.probe_has_video_stream(&audio_only).await.unwrap(),
+                "an audio-only file must probe false -- this is the exact shape \
+                 of the pre-H.264 recordings the UI has to label"
+            );
+        }
     }
 
     #[tokio::test]

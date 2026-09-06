@@ -1815,6 +1815,7 @@ fn recording_row(r: &api::CourseRecordingListItemDto, course_slug: &str) -> Elem
     let when = format_session_ts(&r.starts_at);
     let status = recording_status_label(&r.processing_status);
     let is_available = r.has_playback && r.processing_status == "available";
+    let audio_only = r.has_video == Some(false);
     let href = format!("/courses/{course_slug}/sessions/{}", r.session_id);
     rsx! {
         li { class: "recording-item",
@@ -1824,8 +1825,20 @@ fn recording_row(r: &api::CourseRecordingListItemDto, course_slug: &str) -> Elem
             }
             div { class: "row-2",
                 span { class: "muted", "{duration} · {status}" }
+                // Flag it in the LIST, not just the player: the point is to set
+                // the expectation before someone clicks "Watch replay" and
+                // finds a black rectangle. Only an explicit false qualifies --
+                // an unprobed recording must not be labelled.
+                if audio_only {
+                    span { class: "recording-badge recording-badge--audio-only",
+                        title: "This recording has no video track - only the audio was saved.",
+                        "Audio only"
+                    }
+                }
                 if is_available {
-                    a { class: "ds-button ds-button--secondary", href: "{href}", "Watch replay" }
+                    a { class: "ds-button ds-button--secondary", href: "{href}",
+                        if audio_only { "Listen to replay" } else { "Watch replay" }
+                    }
                 }
             }
         }

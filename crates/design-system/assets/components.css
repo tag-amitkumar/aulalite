@@ -9007,3 +9007,64 @@ summary:focus-visible {
   .marketing-stack-card { position: relative; top: auto; margin-bottom: 2rem; opacity: 1 !important; transform: none !important; }
   .marketing-page [data-motion-image] { opacity: 1 !important; transform: none !important; }
 }
+
+/* --- Audio-only recordings -------------------------------------------------
+   Some recordings genuinely have no picture: classes captured before the
+   switch to H.264 were published as VP8, which the MP4 muxer cannot carry
+   through the `-c copy` remux, so the video track was dropped and only the
+   Opus audio survived. Rendered as a normal player those show a full-size
+   black rectangle that plays sound, which reads as "the video is broken".
+
+   The element stays a <video> on purpose -- it plays the audio correctly and
+   the chapter/chat sync reads currentTime off it -- so the fix is purely
+   presentational: collapse the empty picture area down to the control strip
+   and explain, once, why there is nothing to look at. */
+.replay-video--audio-only {
+  min-height: 0;
+  height: 54px;             /* the native control strip, nothing more */
+  background: transparent;
+}
+
+.replay-audio-only-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-4);
+  margin-bottom: var(--space-3);
+  background: var(--color-ink-stage-deep);
+  border: 1px solid var(--color-on-ink-subtle);
+  border-radius: var(--radius-md);
+}
+
+.replay-audio-only-banner__icon { font-size: 1.5rem; line-height: 1; }
+
+.replay-audio-only-banner__title {
+  margin: 0 0 var(--space-1);
+  font-weight: 600;
+  color: #fff;
+}
+
+.replay-audio-only-banner__detail {
+  margin: 0;
+  font-size: var(--font-size-sm, 0.875rem);
+  color: var(--color-on-ink-muted, rgba(255, 255, 255, 0.72));
+}
+
+/* Same fact, stated in the recordings list, so the expectation is set before
+   anyone clicks through to the player. */
+.recording-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--font-size-xs, 0.75rem);
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.recording-badge--audio-only {
+  color: var(--color-info-ink, #1c4f73);
+  background: var(--color-info-wash, #e7f1f8);
+  border: 1px solid var(--color-info, #2f6f9f);
+}

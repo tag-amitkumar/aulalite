@@ -1924,6 +1924,10 @@ pub struct CourseRecordingListItemDto {
     pub duration_seconds: i32,
     pub processing_status: String,
     pub has_playback: bool,
+    /// Some(false) when the stored MP4 has no video stream, so the list can say
+    /// so before anyone opens it. None = never probed; rendered as normal.
+    #[serde(default)]
+    pub has_video: Option<bool>,
 }
 
 pub async fn list_course_recordings(
