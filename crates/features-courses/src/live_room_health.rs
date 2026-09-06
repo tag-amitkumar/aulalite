@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     Ok,
+    /// A transient, expected in-progress state -- NOT a fault.
+    ///
+    /// Going live legitimately takes seconds: the browser gathers ICE, POSTs the
+    /// WHIP offer, waits for the connection, and only then does MediaMTX create
+    /// the path. Throughout that window the server's `main_stream` check has no
+    /// path to look at and correctly answers `Error`. Rendering that verbatim
+    /// meant the strip flashed a red "Error" on every single go-live, which
+    /// teaches people to ignore the one widget that is supposed to tell them
+    /// when something is actually wrong.
+    NotReady,
     Warning,
     Error,
     Unknown,
@@ -19,6 +29,7 @@ impl HealthStatus {
     pub fn label(self) -> &'static str {
         match self {
             HealthStatus::Ok => "OK",
+            HealthStatus::NotReady => "Not ready",
             HealthStatus::Warning => "Warning",
             HealthStatus::Error => "Error",
             HealthStatus::Unknown => "Unknown",
@@ -29,6 +40,7 @@ impl HealthStatus {
     pub fn class(self) -> &'static str {
         match self {
             HealthStatus::Ok => "ok",
+            HealthStatus::NotReady => "not-ready",
             HealthStatus::Warning => "warning",
             HealthStatus::Error => "error",
             HealthStatus::Unknown => "unknown",
@@ -40,9 +52,10 @@ impl HealthStatus {
         match self {
             HealthStatus::NotApplicable => 0,
             HealthStatus::Ok => 1,
-            HealthStatus::Unknown => 2,
-            HealthStatus::Warning => 3,
-            HealthStatus::Error => 4,
+            HealthStatus::NotReady => 2,
+            HealthStatus::Unknown => 3,
+            HealthStatus::Warning => 4,
+            HealthStatus::Error => 5,
         }
     }
 }
@@ -135,6 +148,24 @@ impl SocketHealthStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrowserRoomHealth {
     pub devices_captured: bool,
+    /// The teacher is going live but publishing is not confirmed yet.
+    ///
+    /// Distinguishes "the stream has not come up YET" from "the stream is
+    /// broken". Without it both look identical to the health strip, because
+    /// both mean "no MediaMTX path".
+    pub publish_starting: bool,
+    /// Every server snapshot we hold was taken BEFORE the current publisher
+    /// existed, so none of them has actually looked at it.
+    ///
+    /// The server maps "no MediaMTX path" to `Error` whenever the session is
+    /// live. That is right for a class that should already be streaming and
+    /// wrong for the seconds before the teacher's first publish lands. A
+    /// snapshot from that window describes a world with no stream in it BY
+    /// CONSTRUCTION, and it stays in the signal until the next 15s poll -- so
+    /// the strip flashed a red "Error" the moment `publish_starting` handed
+    /// over, purely from an observation that predated the thing it looked like
+    /// it was reporting on.
+    pub server_stream_stale: bool,
     pub publish_active: bool,
     pub screen_publish_active: bool,
     pub socket_status: SocketHealthStatus,
@@ -245,10 +276,38 @@ fn merge_stream_item(
     server: Option<&LiveSessionHealthDto>,
     browser: &BrowserRoomHealth,
 ) -> HealthItem {
-    let server_check = server.map(|health| &health.main_stream);
-    let server_status = server_check
-        .map(|check| check.status)
-        .unwrap_or(HealthStatus::Unknown);
+    // Still coming up: report NOT READY and do not consult the server at all.
+    // Its main_stream check is looking for a path that is not supposed to exist
+    // yet, so its Error is expected noise rather than information. A genuine
+    // failure still surfaces immediately -- `video_error` is set from
+    // `PublishState::Error`, which this deliberately does not mask -- and once
+    // publishing is confirmed the normal merge below takes over.
+    if browser.publish_starting && browser.video_error.is_none() {
+        return HealthItem::new(
+            "Stream",
+            HealthStatus::NotReady,
+            "Starting the stream - waiting for the media server to accept it",
+        );
+    }
+
+    // Drop a pre-publisher observation instead of letting it vote.
+    // `NotApplicable` is rank 0, so the verdict falls back to what this browser
+    // can see for itself -- and by this point that is a connected publisher.
+    //
+    // Deliberately NOT a second `NotReady` branch: if the health probe never
+    // recovers, the snapshot stays stale for the rest of the class, and pinning
+    // the strip to "Not ready" that whole time would be its own false report.
+    // A broken probe is surfaced on the Media server row, where it belongs.
+    let server_check = server
+        .map(|health| &health.main_stream)
+        .filter(|_| !browser.server_stream_stale);
+    let server_status = if browser.server_stream_stale {
+        HealthStatus::NotApplicable
+    } else {
+        server_check
+            .map(|check| check.status)
+            .unwrap_or(HealthStatus::Unknown)
+    };
     let local_status = if browser.video_error.is_some() {
         HealthStatus::Error
     } else if browser.publish_active {
@@ -634,12 +693,181 @@ mod tests {
     fn browser_health() -> BrowserRoomHealth {
         BrowserRoomHealth {
             devices_captured: true,
+            publish_starting: false,
+            server_stream_stale: false,
             publish_active: true,
             screen_publish_active: false,
             socket_status: SocketHealthStatus::Connected,
             quality: NetQuality::Good,
             video_error: None,
         }
+    }
+
+    #[test]
+    fn going_live_reports_not_ready_not_error() {
+        // The exact shape of the bug: the room is still coming up, so the server
+        // has no path and reports Error. That must read as "Not ready".
+        let mut server = server_health();
+        server.main_stream = check(
+            HealthStatus::Error,
+            "Main stream",
+            "Main stream is inactive while class is live",
+        );
+        let mut browser = browser_health();
+        browser.publish_starting = true;
+        browser.publish_active = false;
+
+        let model = merge_live_room_health(Some(&server), browser);
+        assert_eq!(model.stream.status, HealthStatus::NotReady);
+        assert_eq!(model.stream.status.label(), "Not ready");
+        assert!(
+            model.stream.detail.to_lowercase().contains("starting"),
+            "detail should explain it is starting, got: {}",
+            model.stream.detail
+        );
+        // And it must not drag the whole strip to Error.
+        assert_ne!(model.overall_status, HealthStatus::Error);
+    }
+
+    #[test]
+    fn a_real_failure_while_starting_is_still_an_error() {
+        // publish_starting must never mask an actual publish failure.
+        let mut browser = browser_health();
+        browser.publish_starting = true;
+        browser.publish_active = false;
+        browser.video_error = Some("WHIP publish did not connect: ICE failed".into());
+
+        let model = merge_live_room_health(Some(&server_health()), browser);
+        assert_eq!(model.stream.status, HealthStatus::Error);
+        assert!(model.stream.detail.contains("ICE failed"));
+    }
+
+    #[test]
+    fn not_ready_ranks_above_ok_but_below_any_fault() {
+        // Overall status must still be driven by genuine faults.
+        assert!(HealthStatus::NotReady.rank() > HealthStatus::Ok.rank());
+        assert!(HealthStatus::NotReady.rank() < HealthStatus::Warning.rank());
+        assert!(HealthStatus::NotReady.rank() < HealthStatus::Error.rank());
+        assert!(HealthStatus::NotReady.rank() < HealthStatus::Unknown.rank());
+        assert_eq!(
+            worst_status([HealthStatus::NotReady, HealthStatus::Error]),
+            HealthStatus::Error
+        );
+        assert_eq!(
+            worst_status([HealthStatus::Ok, HealthStatus::NotReady]),
+            HealthStatus::NotReady
+        );
+    }
+
+    #[test]
+    fn not_ready_offers_no_retry_action() {
+        // Retry is offered for Warning/Error. Mid-startup there is nothing to
+        // retry, so the affordance must stay hidden.
+        assert!(!matches!(
+            HealthStatus::NotReady,
+            HealthStatus::Warning | HealthStatus::Error
+        ));
+    }
+
+    #[test]
+    fn stale_pre_publisher_snapshot_does_not_report_error() {
+        // The exact residual bug the end-to-end run caught: the publisher lands
+        // at ~12s, `publish_starting` goes false, and the merge hands over to a
+        // snapshot fetched at t=0 -- before any path could exist -- which says
+        // Error. That must not reach the strip.
+        let mut server = server_health();
+        server.main_stream = check(
+            HealthStatus::Error,
+            "Main stream",
+            "Session is live but the teacher stream is not active on the media server",
+        );
+        let mut browser = browser_health();
+        browser.server_stream_stale = true;
+
+        let model = merge_live_room_health(Some(&server), browser);
+        assert_eq!(model.stream.status, HealthStatus::Ok);
+        assert_ne!(model.overall_status, HealthStatus::Error);
+        assert!(
+            model.stream.detail.contains("publishing from this browser"),
+            "detail should fall back to the local view, got: {}",
+            model.stream.detail
+        );
+    }
+
+    #[test]
+    fn a_post_publisher_snapshot_is_still_trusted() {
+        // Once the server has actually looked at the running publisher, an
+        // Inactive path is a real fault and must surface. This is what stops
+        // the staleness rule from becoming a blanket mute.
+        let mut server = server_health();
+        server.main_stream = check(
+            HealthStatus::Error,
+            "Main stream",
+            "Session is live but the teacher stream is not active on the media server",
+        );
+        let mut browser = browser_health();
+        browser.server_stream_stale = false;
+
+        let model = merge_live_room_health(Some(&server), browser);
+        assert_eq!(model.stream.status, HealthStatus::Error);
+        assert_eq!(model.overall_status, HealthStatus::Error);
+    }
+
+    #[test]
+    fn stale_snapshot_never_masks_a_local_publish_failure() {
+        // Staleness only silences the SERVER's opinion. A failure this browser
+        // observed directly is still an error.
+        let mut browser = browser_health();
+        browser.server_stream_stale = true;
+        browser.publish_active = false;
+        browser.video_error = Some("WHIP publish did not connect: ICE failed".into());
+
+        let model = merge_live_room_health(Some(&server_health()), browser);
+        assert_eq!(model.stream.status, HealthStatus::Error);
+        assert!(model.stream.detail.contains("ICE failed"));
+    }
+
+    #[test]
+    fn the_full_go_live_sequence_never_shows_a_false_error() {
+        // Walks the three states the live room actually passes through, against
+        // a server that reports Error until its first post-publisher poll.
+        let mut server = server_health();
+        server.main_stream = check(
+            HealthStatus::Error,
+            "Main stream",
+            "Session is live but the teacher stream is not active on the media server",
+        );
+
+        // 1. Going live: local publisher not up yet.
+        let mut starting = browser_health();
+        starting.publish_starting = true;
+        starting.publish_active = false;
+        starting.server_stream_stale = true;
+
+        // 2. Publisher landed; every snapshot still predates it.
+        let mut connected = browser_health();
+        connected.server_stream_stale = true;
+
+        // 3. First post-publisher poll agrees the path is up.
+        let settled = browser_health();
+
+        let sequence = [
+            merge_live_room_health(Some(&server), starting).stream.status,
+            merge_live_room_health(Some(&server), connected).stream.status,
+            merge_live_room_health(Some(&server_health()), settled)
+                .stream
+                .status,
+        ];
+
+        assert_eq!(
+            sequence,
+            [HealthStatus::NotReady, HealthStatus::Ok, HealthStatus::Ok],
+            "go-live must read Not ready -> OK with no Error in between"
+        );
+        assert!(
+            !sequence.contains(&HealthStatus::Error),
+            "no step of a healthy go-live may report Error"
+        );
     }
 
     #[test]

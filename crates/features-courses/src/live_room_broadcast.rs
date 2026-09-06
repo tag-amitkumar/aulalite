@@ -159,6 +159,20 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
     let socket_status = use_signal(|| crate::live_room_socket::ConnStatus::Disconnected);
     let server_health = use_signal(|| None::<crate::live_room_health::LiveSessionHealthDto>);
     let health_fetch_error = use_signal(|| None::<String>);
+    // Ordering machinery for "has the server actually looked at this publisher
+    // yet?". Sequence numbers rather than timestamps: the server's `checked_at`
+    // comes off a different clock than the browser's, and the two can disagree
+    // by more than the window being measured.
+    //
+    // `health_poll_seq` counts polls STARTED, `health_snapshot_seq` records
+    // which poll produced the snapshot currently held, and `publisher_seen_at`
+    // freezes `health_poll_seq` at the instant the publisher appeared. Counting
+    // starts, not completions, is what makes a poll that was already in flight
+    // when the publisher landed come back correctly marked as pre-publisher --
+    // it queried a media server that had no path yet, however late it lands.
+    let health_poll_seq = use_signal(|| 0u64);
+    let health_snapshot_seq = use_signal(|| None::<u64>);
+    let publisher_seen_at = use_signal(|| None::<u64>);
     let mut diagnostics_open = use_signal(|| false);
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -425,16 +439,42 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
         let health_session_id = props.session_id.clone();
         let health_w = server_health;
         let error_w = health_fetch_error;
+        let poll_seq_w = health_poll_seq;
+        let snapshot_seq_w = health_snapshot_seq;
         use_future(move || {
             let session_id = health_session_id.clone();
             async move {
                 loop {
-                    refresh_server_health(health_api, session_id.clone(), health_w, error_w).await;
+                    refresh_server_health(health_api, session_id.clone(), health_w, error_w, poll_seq_w, snapshot_seq_w).await;
                     #[cfg(target_arch = "wasm32")]
                     gloo_timers::future::TimeoutFuture::new(15_000).await;
                     #[cfg(not(target_arch = "wasm32"))]
                     crate::live_room_native::delay(15_000).await;
                 }
+            }
+        });
+    }
+
+    // Stamp the poll sequence at the instant the publisher appears (and clear
+    // it when the publisher goes away, so a republish is re-evaluated from
+    // scratch rather than inheriting the previous run's confirmation).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let session_watch = session;
+        let poll_seq = health_poll_seq;
+        let mut seen_at = publisher_seen_at;
+        use_effect(move || {
+            let ready = session_watch.and_then(|s| s.read().publisher_pc()).is_some();
+            let current = *poll_seq.read();
+            // `peek`, not `read`: writing a signal this effect subscribes to
+            // would re-trigger it forever. Bind before matching -- a guard held
+            // in the scrutinee lives for the whole `match`, and the arms write
+            // the same signal.
+            let recorded = *seen_at.peek();
+            match (ready, recorded) {
+                (true, None) => seen_at.set(Some(current)),
+                (false, Some(_)) => seen_at.set(None),
+                _ => {}
             }
         });
     }
@@ -966,16 +1006,64 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
         PublishState::Error(message) => (false, false, Some(message.clone())),
         PublishState::Idle | PublishState::GoingLive => (false, false, None),
     };
+    // "Going live, not up yet."
+    //
+    // `publish_active` cannot answer this on its own: when the session is
+    // already live this component OPTIMISTICALLY initialises
+    // `Live { main_active: true }` (see the top of LiveRoomBroadcast) before
+    // anything has actually been published, so it claims to be publishing during
+    // the very window we need to identify. The session only holds a publisher
+    // once `publish()` has returned Ok, so that is the honest signal -- and
+    // reading it here subscribes the strip, so it flips to OK the moment the
+    // publisher lands.
+    #[cfg(target_arch = "wasm32")]
+    let publisher_ready = session.and_then(|s| s.read().publisher_pc()).is_some();
+    #[cfg(not(target_arch = "wasm32"))]
+    let publisher_ready = publish_active;
+
+    // Idle is NOT starting: nothing is being attempted, so there is nothing to
+    // be not-ready about.
+    let publish_starting = matches!(&current, PublishState::GoingLive)
+        || (matches!(&current, PublishState::Live { .. }) && !publisher_ready);
+
     #[cfg(target_arch = "wasm32")]
     let devices_captured = self_stream.read().is_some();
     #[cfg(not(target_arch = "wasm32"))]
     let devices_captured = publish_active;
 
     let server_snapshot = server_health.read().clone();
+
+    // Was the snapshot we are about to render taken before this publisher
+    // existed? The poll runs every 15s from mount, so the snapshot sitting in
+    // the signal when publishing completes was typically fetched before the
+    // teacher even clicked Go live -- and the server reports "no path" as an
+    // Error once the session is live, which is exactly the false red we are
+    // eliminating.
+    //
+    // `None` for either sequence number means stale, not fresh:
+    //   - no stamp yet: the publisher is up but the effect that records it has
+    //     not run for this render, so nothing has been correlated with it. The
+    //     honest answer for that frame is "unobserved", and guessing "fresh"
+    //     would flash the Error for exactly one frame -- the original bug, just
+    //     briefer and harder to catch.
+    //   - no snapshot sequence: no successful poll has ever completed, so there
+    //     is nothing to trust. (Guarded by `is_some()` so a room that has never
+    //     fetched health keeps its existing Unknown reading.)
+    let publisher_stamp = *publisher_seen_at.read();
+    let snapshot_seq = *health_snapshot_seq.read();
+    let server_stream_stale = publisher_ready
+        && server_snapshot.is_some()
+        && match (snapshot_seq, publisher_stamp) {
+            (Some(seq), Some(stamp)) => seq < stamp,
+            _ => true,
+        };
+
     let mut health_model = crate::live_room_health::merge_live_room_health(
         server_snapshot.as_ref(),
         crate::live_room_health::BrowserRoomHealth {
             devices_captured,
+            publish_starting,
+            server_stream_stale,
             publish_active,
             screen_publish_active,
             socket_status: crate::live_room_health::SocketHealthStatus::from(*socket_status.read()),
@@ -1009,8 +1097,10 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
         let session_id = refresh_session_id.clone();
         let health = server_health;
         let error = health_fetch_error;
+        let poll_seq = health_poll_seq;
+        let snapshot_seq = health_snapshot_seq;
         spawn(async move {
-            refresh_server_health(health_api_for_actions, session_id, health, error).await;
+            refresh_server_health(health_api_for_actions, session_id, health, error, poll_seq, snapshot_seq).await;
         });
     };
 
@@ -1122,6 +1212,8 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
         let session_id = retry_recording_session_id.clone();
         let mut error = health_fetch_error;
         let health = server_health;
+        let poll_seq = health_poll_seq;
+        let snapshot_seq = health_snapshot_seq;
         spawn(async move {
             let api = health_api_for_actions.read().clone();
             let path = format!("/v1/sessions/{session_id}/recording/retry");
@@ -1129,7 +1221,7 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
                 .await
             {
                 Ok(_) => {
-                    refresh_server_health(health_api_for_actions, session_id, health, error).await;
+                    refresh_server_health(health_api_for_actions, session_id, health, error, poll_seq, snapshot_seq).await;
                 }
                 Err(err) => error.set(Some(format!("Recording recovery could not start: {err}"))),
             }
@@ -1872,12 +1964,27 @@ async fn refresh_server_health(
     session_id: String,
     mut health: Signal<Option<crate::live_room_health::LiveSessionHealthDto>>,
     mut error: Signal<Option<String>>,
+    mut poll_seq: Signal<u64>,
+    mut snapshot_seq: Signal<Option<u64>>,
 ) {
+    // Claim this poll's sequence number BEFORE awaiting. The number records
+    // when the request went out, not when it came back, so a poll that overlaps
+    // the moment the publisher lands is correctly filed as pre-publisher -- it
+    // asked the media server about a path that did not exist yet.
+    let started_at = {
+        let current = *poll_seq.peek();
+        poll_seq.set(current.wrapping_add(1));
+        current
+    };
     let ctx = api.read().clone();
     match crate::live_room_health::fetch_session_health(&ctx, &session_id).await {
         Ok(snapshot) => {
             health.set(Some(snapshot));
             error.set(None);
+            // Only a SUCCESSFUL fetch republishes the sequence: a failed poll
+            // leaves the previous snapshot in place, so it has observed nothing
+            // new and must not be allowed to look fresher than it is.
+            snapshot_seq.set(Some(started_at));
         }
         Err(err) => {
             // Keep the last known snapshot visible during a transient probe

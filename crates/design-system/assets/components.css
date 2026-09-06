@@ -6810,6 +6810,7 @@ summary:focus-visible {
 .health-status--ok { --health-color: var(--color-success, #267a55); }
 .health-status--warning { --health-color: var(--color-warning, #b7791f); }
 .health-status--error { --health-color: var(--color-danger, #b83b36); }
+.health-status--not-ready { --health-color: var(--color-info, #2f6f9f); }
 .health-status--unknown { --health-color: var(--color-neutral-400, #908b81); }
 .health-status--not-applicable { --health-color: var(--color-neutral-300, #c3beb3); }
 .live-room-health-strip__label { color: var(--color-text); font-weight: 700; }
