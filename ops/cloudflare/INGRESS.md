@@ -32,13 +32,43 @@ Two consequences that cost real debugging time:
 |---|---|---|
 | `aula.elementors.guru` | `http://localhost:3000` | app + API (nginx proxies `/v1/*` and the live-room WebSocket) |
 | `media.elementors.guru` | `http://localhost:8889` | **MediaMTX WebRTC signalling** (WHIP/WHEP) |
-| `media.aula.elementors.guru` | `http://localhost:8889` | same, pre-routed but TLS-blocked — see below |
 | `stream.elementors.guru` | `http://localhost:8888` | MediaMTX HLS (watch-only fallback) |
-| `stream.aula.elementors.guru` | `http://localhost:8888` | same, TLS-blocked |
+| `storage.elementors.guru` | `http://localhost:9000` | **RustFS S3** — presigned recording playback, uploads, attachments |
 | *(catch-all)* | `http_status:404` | refuse rather than silently serve |
 
+The `*.aula.` variants described in earlier revisions of this file are no longer in the
+live config; the table above is the applied ingress as of 2026-09-06.
+
 MediaMTX's API (9997) and metrics (9998) are deliberately **not** exposed — they are
-unauthenticated control surfaces.
+unauthenticated control surfaces. Neither is the RustFS **console on 9001**: only the S3
+API on 9000 is routed. (9001 is still published on `0.0.0.0` by compose, so it remains
+reachable from the LAN even though it is not on the internet.)
+
+## `storage.elementors.guru` — why it exists and what it must not have
+
+Added 2026-09-06 (fix-plan phase C). Recording playback was dead in the browser: the
+backend signs presigned URLs with `S3_ENDPOINT_URL`, that was `http://localhost:9000`, and
+the app's CSP is `media-src 'self' blob: https:`. Chrome rejected the URL before issuing a
+single request — `securitypolicyviolation` on `media-src`, `MEDIA_ELEMENT_ERROR: Media load
+rejected by URL safety check`. The host is inside the SigV4 signature, so it cannot be
+rewritten client-side; the origin itself had to become https.
+
+**No Cloudflare Access on this hostname.** The browser fetches these URLs unauthenticated —
+SigV4 in the query string *is* the authentication. An Access policy would block playback.
+
+**It cannot be a path prefix under `aula.`** — `force_path_style(true)` signs the full path,
+so any nginx prefix rewrite breaks the SigV4 canonical URI and returns 403.
+
+**Rotate the RustFS root credentials before ever exposing 9000** (done 2026-09-06). The key
+id travels in plaintext in every presigned URL as `X-Amz-Credential`, so shipping the
+`aulalite` / `changeme123` defaults would hand an attacker half the pair and, with it, full
+read/write/delete over every tenant's recordings, submissions and attachments.
+
+Verified after the change: presigned GET returns 200 with byte-identical content through the
+edge, `Range` requests return 206 (seeking works), unsigned GET and bucket listing return
+403, and presigned PUT uploads succeed. Note Cloudflare caps request bodies at **100 MB** on
+free/pro, while the app permits 500 MB for `video` and `scorm` — uploads above the cap will
+fail at the edge with 413 even though the app would accept them.
 
 `elementors.guru` / `www.elementors.guru` are deliberately absent: the marketing site is
 a **separate PHP origin** (`X-Powered-By: PHP/7.4.33`) reached by its own proxied DNS
