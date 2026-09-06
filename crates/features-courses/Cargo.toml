@@ -49,6 +49,11 @@ web-sys = { version = "0.3", features = [
     "RtcRtpCapabilities",
     "RtcRtpEncodingParameters",
     "MediaStream","MediaStreamTrack","MediaDevices","MediaStreamConstraints","DisplayMediaStreamConstraints",
+    # `MediaStreamTrack::ready_state()` returns MediaStreamTrackState, and
+    # web-sys gates a method on the features of the types in its signature --
+    # so verifying a captured track is actually "live" needs the STATE type
+    # enabled, not just MediaStreamTrack. Same trap as RtcIceGatheringState.
+    "MediaStreamTrackState",
     "Navigator","HtmlVideoElement","HtmlMediaElement",
     # Conferencing (Pillar 1): device picker, in-call camera switch, mic-level
     # meter, and network-quality stats.

@@ -2349,6 +2349,49 @@ fn set_tracks_enabled(
 /// enhancements enabled (noise suppression, echo cancellation, auto gain),
 /// returned as a `JsValue` object. Browsers ignore unknown keys, so this is
 /// safe across engines and needs no extra web-sys binding.
+/// One tagged console line per publish stage. A teacher's publisher failing is
+/// almost always diagnosed from their console after the fact.
+#[cfg(target_arch = "wasm32")]
+fn log_publish(msg: &str) {
+    web_sys::console::log_1(&format!("[live_room_publish] {msg}").into());
+}
+
+/// Classify a getUserMedia rejection and turn it into the user-facing text,
+/// logging the raw DOMException name alongside. Never panics.
+#[cfg(target_arch = "wasm32")]
+fn gum_error_text(e: &wasm_bindgen::JsValue) -> String {
+    let name = js_sys::Reflect::get(e, &wasm_bindgen::JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    log_publish(&format!("getUserMedia rejected: {name} ({e:?})"));
+    crate::live_room_capture::gum_failure_message(crate::live_room_capture::classify_gum_failure(
+        &name,
+    ))
+}
+
+/// `(live_audio, live_video)` counts for a captured stream.
+#[cfg(target_arch = "wasm32")]
+fn count_live_tracks(stream: &web_sys::MediaStream) -> (usize, usize) {
+    use wasm_bindgen::JsCast;
+    let tracks = stream.get_tracks();
+    let (mut audio, mut video) = (0usize, 0usize);
+    for i in 0..tracks.length() {
+        let Ok(t) = tracks.get(i).dyn_into::<web_sys::MediaStreamTrack>() else {
+            continue;
+        };
+        if t.ready_state() != web_sys::MediaStreamTrackState::Live {
+            continue;
+        }
+        match t.kind().as_str() {
+            "audio" => audio += 1,
+            "video" => video += 1,
+            _ => {}
+        }
+    }
+    (audio, video)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn audio_constraints(mic_id: &str) -> wasm_bindgen::JsValue {
     let obj = js_sys::Object::new();
@@ -2426,28 +2469,72 @@ async fn go_live_flow(
     let media = nav
         .media_devices()
         .map_err(|e| format!("media_devices: {e:?}"))?;
+    // Enumerate BEFORE requesting, and ask only for what exists.
+    //
+    // The old code asked for `{audio, video}` unconditionally. That request is
+    // all-or-nothing: on a machine with a microphone but no camera the browser
+    // rejects the whole thing with NotFoundError, so the teacher lost the audio
+    // they could have broadcast, and the surfaced error named neither device.
+    // It also passed a saved deviceId straight through, so an unplugged camera
+    // kept being requested by id forever.
+    let pre = crate::live_room_devices::enumerate().await;
+    let (pre_cams, pre_mics, _) = crate::live_room_devices::partition_by_kind(&pre);
+    log_publish(&format!(
+        "enumerateDevices: {} camera(s), {} microphone(s)",
+        pre_cams.len(),
+        pre_mics.len()
+    ));
+    let plan = match crate::live_room_capture::plan_capture(
+        &pre_cams, &pre_mics, &camera_id, &mic_id,
+    ) {
+        crate::live_room_capture::CaptureDecision::NoInputDevices => {
+            log_publish("no camera and no microphone -- refusing to publish");
+            return Err(crate::live_room_capture::no_input_devices_message());
+        }
+        crate::live_room_capture::CaptureDecision::Capture(p) => p,
+    };
+    log_publish(&format!("requesting {}", plan.summary()));
+
     let constraints = web_sys::MediaStreamConstraints::new();
-    // Honor the prejoin-selected camera, else the browser default.
-    if camera_id.is_empty() {
-        constraints.set_video(&wasm_bindgen::JsValue::TRUE);
+    if plan.want_video {
+        match plan.camera_id.as_deref() {
+            Some(id) => {
+                let vc = web_sys::MediaTrackConstraints::new();
+                vc.set_device_id(&wasm_bindgen::JsValue::from_str(id));
+                constraints.set_video(vc.as_ref());
+            }
+            None => constraints.set_video(&wasm_bindgen::JsValue::TRUE),
+        }
     } else {
-        let vc = web_sys::MediaTrackConstraints::new();
-        vc.set_device_id(&wasm_bindgen::JsValue::from_str(&camera_id));
-        constraints.set_video(vc.as_ref());
+        constraints.set_video(&wasm_bindgen::JsValue::FALSE);
     }
     // Audio polish (noise suppression, echo cancellation, auto gain) + the
     // prejoin-selected mic. A plain JS constraints object; browsers ignore
     // unknown keys.
-    constraints.set_audio(&audio_constraints(&mic_id));
+    if plan.want_audio {
+        constraints.set_audio(&audio_constraints(plan.mic_id.as_deref().unwrap_or("")));
+    } else {
+        constraints.set_audio(&wasm_bindgen::JsValue::FALSE);
+    }
     let stream_promise = media
         .get_user_media_with_constraints(&constraints)
-        .map_err(|e| format!("getUserMedia: {e:?}"))?;
+        .map_err(|e| gum_error_text(&e))?;
     let stream_value = JsFuture::from(stream_promise)
         .await
-        .map_err(|e| format!("getUserMedia await: {e:?}"))?;
+        .map_err(|e| gum_error_text(&e))?;
     let stream: web_sys::MediaStream = stream_value
         .dyn_into()
         .map_err(|_| "stream cast".to_string())?;
+
+    // The stream must actually carry live media before we build a peer
+    // connection around it. An ended track publishes a black/silent MediaMTX
+    // path, which from the student side is indistinguishable from a broken
+    // encoder -- reject it here, where the message can still be useful.
+    let (live_audio, live_video) = count_live_tracks(&stream);
+    log_publish(&format!(
+        "captured tracks: {live_audio} live audio, {live_video} live video"
+    ));
+    crate::live_room_capture::publishable_verdict(live_audio, live_video)?;
 
     // Keep the RAW camera/mic handle for cleanup (and future device toggles).
     //

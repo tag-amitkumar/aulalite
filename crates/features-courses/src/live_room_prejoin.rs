@@ -385,22 +385,98 @@ mod imp {
                     }
                 };
 
-                // Build constraints honoring any chosen device ids.
-                let constraints = build_constraints(&want_camera, &want_mic);
-                let stream = match media.get_user_media_with_constraints(&constraints) {
-                    Ok(promise) => match JsFuture::from(promise).await {
-                        Ok(v) => v.unchecked_into::<web_sys::MediaStream>(),
-                        Err(e) => {
-                            error.set(Some(humanize_gum_error(&e)));
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        error.set(Some(humanize_gum_error(&e)));
+                // ENUMERATE FIRST.
+                //
+                // Previously this asked for `{audio: true, video: true}` and
+                // let the browser sort it out. That request is all-or-nothing:
+                // a machine with a microphone but no camera rejects the whole
+                // call with NotFoundError, so the teacher lost their audio too
+                // and the message named neither device. Enumerating first costs
+                // one call and lets us ask only for what exists -- and, when
+                // nothing exists, skip getUserMedia entirely and say so.
+                //
+                // Labels are empty until a permission has been granted, but we
+                // only need kinds and ids here; the labelled re-enumeration
+                // still happens after capture succeeds, below.
+                let pre = crate::live_room_devices::enumerate().await;
+                let (pre_cams, pre_mics, _) = partition_by_kind(&pre);
+                log_capture(&format!(
+                    "enumerateDevices (pre-capture): {} camera(s), {} microphone(s)",
+                    pre_cams.len(),
+                    pre_mics.len()
+                ));
+
+                let plan = match crate::live_room_capture::plan_capture(
+                    &pre_cams,
+                    &pre_mics,
+                    &want_camera,
+                    &want_mic,
+                ) {
+                    crate::live_room_capture::CaptureDecision::NoInputDevices => {
+                        log_capture(
+                            "no camera and no microphone present -- not calling getUserMedia",
+                        );
+                        cameras.set(pre_cams);
+                        mics.set(pre_mics);
+                        error.set(Some(crate::live_room_capture::no_input_devices_message()));
                         return;
                     }
+                    crate::live_room_capture::CaptureDecision::Capture(p) => p,
                 };
-                error.set(None);
+                log_capture(&format!("requesting {}", plan.summary()));
+
+                let stream = match open_capture(&media, &plan).await {
+                    Ok(s) => s,
+                    Err(kind) => {
+                        // Overconstrained means the chosen deviceId matched
+                        // nothing. That is recoverable exactly once: drop the
+                        // ids and let the browser choose. Any other failure is
+                        // reported as-is -- retrying a denied permission or
+                        // absent hardware just fails again, slower.
+                        if kind.is_retryable_without_device_id()
+                            && (plan.camera_id.is_some() || plan.mic_id.is_some())
+                        {
+                            log_capture("constraints unsatisfiable; retrying with browser defaults");
+                            let relaxed = crate::live_room_capture::CapturePlan {
+                                camera_id: None,
+                                mic_id: None,
+                                ..plan.clone()
+                            };
+                            match open_capture(&media, &relaxed).await {
+                                Ok(s) => {
+                                    // The stored ids are stale; clear them so
+                                    // the dropdowns re-seed from what is live.
+                                    camera_id.set(String::new());
+                                    mic_id.set(String::new());
+                                    s
+                                }
+                                Err(k2) => {
+                                    error.set(Some(crate::live_room_capture::gum_failure_message(
+                                        k2,
+                                    )));
+                                    return;
+                                }
+                            }
+                        } else {
+                            error.set(Some(crate::live_room_capture::gum_failure_message(kind)));
+                            return;
+                        }
+                    }
+                };
+                log_capture(&format!(
+                    "getUserMedia OK: {}",
+                    describe_tracks(&stream)
+                ));
+                // A partial capture is real, publishable media -- but say so,
+                // rather than letting the teacher discover it mid-class.
+                if plan.is_complete() {
+                    error.set(None);
+                } else {
+                    error.set(Some(format!(
+                        "Broadcasting with {} -- the missing device was not found on this computer.",
+                        plan.summary()
+                    )));
+                }
 
                 // Wire the stream onto the preview <video>.
                 if let Some(doc) = win.document() {
@@ -442,25 +518,91 @@ mod imp {
     }
 
     /// getUserMedia constraints honoring optional exact device ids.
-    fn build_constraints(camera_id: &str, mic_id: &str) -> web_sys::MediaStreamConstraints {
+    /// One tagged console line per capture stage. The publisher failing is
+    /// nearly always diagnosed from a teacher's console after the fact, and
+    /// previously the only trace was a single humanized sentence with no
+    /// record of what was asked for or what came back.
+    pub(super) fn log_capture(msg: &str) {
+        web_sys::console::log_1(&format!("[live_room_capture] {msg}").into());
+    }
+
+    /// `kind:readyState` for every track, e.g. `audio:live, video:live`.
+    pub(super) fn describe_tracks(stream: &web_sys::MediaStream) -> String {
+        let tracks = stream.get_tracks();
+        let mut parts = Vec::new();
+        for i in 0..tracks.length() {
+            if let Ok(t) = tracks.get(i).dyn_into::<web_sys::MediaStreamTrack>() {
+                parts.push(format!("{}:{}", t.kind(), format!("{:?}", t.ready_state()).to_lowercase()));
+            }
+        }
+        if parts.is_empty() {
+            "no tracks".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Build constraints from a plan. Only asks for a track kind the plan says
+    /// exists, so a missing camera can never sink the microphone request.
+    fn build_constraints(
+        plan: &crate::live_room_capture::CapturePlan,
+    ) -> web_sys::MediaStreamConstraints {
         let constraints = web_sys::MediaStreamConstraints::new();
 
-        if camera_id.is_empty() {
-            constraints.set_video(&JsValue::TRUE);
+        if plan.want_video {
+            match plan.camera_id.as_deref() {
+                Some(id) => {
+                    let vc = web_sys::MediaTrackConstraints::new();
+                    vc.set_device_id(&JsValue::from_str(id));
+                    constraints.set_video(vc.as_ref());
+                }
+                None => constraints.set_video(&JsValue::TRUE),
+            }
         } else {
-            let vc = web_sys::MediaTrackConstraints::new();
-            vc.set_device_id(&JsValue::from_str(camera_id));
-            constraints.set_video(vc.as_ref());
+            constraints.set_video(&JsValue::FALSE);
         }
 
-        if mic_id.is_empty() {
-            constraints.set_audio(&JsValue::TRUE);
+        if plan.want_audio {
+            match plan.mic_id.as_deref() {
+                Some(id) => {
+                    let ac = web_sys::MediaTrackConstraints::new();
+                    ac.set_device_id(&JsValue::from_str(id));
+                    constraints.set_audio(ac.as_ref());
+                }
+                None => constraints.set_audio(&JsValue::TRUE),
+            }
         } else {
-            let ac = web_sys::MediaTrackConstraints::new();
-            ac.set_device_id(&JsValue::from_str(mic_id));
-            constraints.set_audio(ac.as_ref());
+            constraints.set_audio(&JsValue::FALSE);
         }
         constraints
+    }
+
+    /// Run `getUserMedia` for a plan, classifying any rejection. No unwrap and
+    /// no panic on any path -- a failed capture is an expected outcome here.
+    pub(super) async fn open_capture(
+        media: &web_sys::MediaDevices,
+        plan: &crate::live_room_capture::CapturePlan,
+    ) -> Result<web_sys::MediaStream, crate::live_room_capture::GumFailure> {
+        let constraints = build_constraints(plan);
+        let promise = media
+            .get_user_media_with_constraints(&constraints)
+            .map_err(|e| classify_js(&e))?;
+        match JsFuture::from(promise).await {
+            Ok(v) => v
+                .dyn_into::<web_sys::MediaStream>()
+                .map_err(|_| crate::live_room_capture::GumFailure::Unknown),
+            Err(e) => Err(classify_js(&e)),
+        }
+    }
+
+    /// Pull `.name` off a DOMException and classify it.
+    pub(super) fn classify_js(e: &JsValue) -> crate::live_room_capture::GumFailure {
+        let name = js_sys::Reflect::get(e, &JsValue::from_str("name"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        log_capture(&format!("getUserMedia rejected: {name} ({e:?})"));
+        crate::live_room_capture::classify_gum_failure(&name)
     }
 
     /// Build an AudioContext → analyser graph off the stream's audio track and
@@ -531,27 +673,11 @@ mod imp {
         drop(tick);
     }
 
-    /// Turn a getUserMedia rejection into a user-facing message. The error is a
-    /// DOMException; its `name` tells us why.
-    fn humanize_gum_error(e: &JsValue) -> String {
-        let name = js_sys::Reflect::get(e, &JsValue::from_str("name"))
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        match name.as_str() {
-            "NotAllowedError" | "SecurityError" => {
-                "Camera/microphone access was blocked. Allow access in your browser, then reload."
-                    .to_string()
-            }
-            "NotFoundError" | "OverconstrainedError" => {
-                "No camera or microphone was found.".to_string()
-            }
-            "NotReadableError" => {
-                "Your camera or microphone is already in use by another app.".to_string()
-            }
-            _ => "Couldn't start your camera and microphone.".to_string(),
-        }
-    }
+    // `humanize_gum_error` used to live here. It collapsed NotFoundError and
+    // OverconstrainedError into one sentence, which hid the one failure worth
+    // retrying, and it was a second, untested copy of the wording. Both jobs
+    // now belong to `live_room_capture::{classify_gum_failure,
+    // gum_failure_message}`, which are unit-tested.
 }
 
 #[cfg(test)]

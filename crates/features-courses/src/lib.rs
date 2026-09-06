@@ -95,6 +95,7 @@ pub mod assignment_list;
 pub mod attendance_panel;
 pub mod live_room_audio_publisher;
 pub mod live_room_chat;
+pub mod live_room_capture;
 pub mod live_room_devices;
 pub mod live_room_hand_raise;
 pub mod live_room_ice;

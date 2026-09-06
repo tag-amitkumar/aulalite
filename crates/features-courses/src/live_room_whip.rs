@@ -327,11 +327,19 @@ mod imp {
         closed: bool,
     }
 
+    /// One tagged console line per WHIP stage. The publisher failing is
+    /// normally diagnosed from a teacher's console after the fact, so each
+    /// stage that can fail independently gets a line.
+    fn log_whip(msg: &str) {
+        web_sys::console::log_1(&format!("[live_room_whip] {msg}").into());
+    }
+
     pub async fn publish(
         whip_url: &str,
         password: &str,
         local_stream: &MediaStream,
     ) -> Result<WhipPublisher, String> {
+        log_whip(&format!("publish -> {whip_url}"));
         let cfg = rtc_config_with_stun();
         let pc = RtcPeerConnection::new_with_configuration(&cfg)
             .map_err(|e| format!("RtcPeerConnection: {e:?}"))?;
@@ -367,6 +375,7 @@ mod imp {
         JsFuture::from(pc.set_local_description(&offer))
             .await
             .map_err(|e| format!("set_local_description: {e:?}"))?;
+        log_whip("setLocalDescription OK; waiting for ICE gathering");
 
         // WHIP is a ONE-SHOT exchange: the SDP POSTed below is the only
         // opportunity to tell MediaMTX where to send its connectivity checks,
@@ -400,6 +409,9 @@ mod imp {
         // Logging both turns "the stream is just black" into a diagnosable
         // event instead of a silent degradation.
         let candidates = crate::live_room_ice::candidate_count(&local_sdp);
+        log_whip(&format!(
+            "ICE gathering complete={gathered}, {candidates} candidate(s) in the offer"
+        ));
         if !gathered || candidates == 0 {
             web_sys::console::warn_1(
                 &format!(
@@ -433,6 +445,7 @@ mod imp {
         let resp: web_sys::Response = resp_value
             .dyn_into()
             .map_err(|_| "response cast".to_string())?;
+        log_whip(&format!("WHIP POST -> {} {}", resp.status(), resp.status_text()));
         if !resp.ok() {
             return Err(format!("WHIP returned {}", resp.status()));
         }
@@ -448,6 +461,10 @@ mod imp {
             .ok()
             .flatten()
             .and_then(|loc| crate::live_room_ice::resolve_resource_url(whip_url, &loc));
+        log_whip(&format!(
+            "Location -> {}",
+            location.as_deref().unwrap_or("(absent -- teardown will be skipped)")
+        ));
         let answer_text_promise = resp.text().map_err(|e| format!("body text: {e:?}"))?;
         let answer_text_value = JsFuture::from(answer_text_promise)
             .await
@@ -484,9 +501,11 @@ mod imp {
         )
         .await
         {
+            log_whip(&format!("publisher did NOT connect: {e}"));
             let _ = publisher.close().await;
             return Err(format!("WHIP publish did not connect: {e}"));
         }
+        log_whip("publisher connected");
 
         Ok(publisher)
     }
