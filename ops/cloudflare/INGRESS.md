@@ -95,6 +95,44 @@ moment **Advanced Certificate Manager / Total TLS** is enabled for `*.aula.eleme
 — then only `MEDIAMTX_PUBLIC_WEBRTC_URL` / `MEDIAMTX_PUBLIC_HLS_URL` in `.env` need
 changing, plus a `docker compose up -d backend`.
 
+## The edge rewrites HTML: Web Analytics beacon vs CSP
+
+Verified end-to-end 2026-09-06 through the public hostnames (not localhost).
+
+The zone has Web Analytics **automatic injection** enabled, so Cloudflare
+rewrites every HTML response to add
+`<script src="https://static.cloudflareinsights.com/beacon.min.js/...">`. Our
+origin never emits it -- confirmed by diffing origin and edge HTML.
+
+Two traps:
+
+* **A plain `curl` does not reproduce the injection.** Cloudflare only rewrites
+  when the request looks like a browser navigation (`Accept: text/html` plus a
+  browser `User-Agent`). `curl https://aula.elementors.guru/` returns the
+  unmodified 4598-byte shell, so the beacon looks absent until you check with a
+  real browser.
+* **It was blocked by our own CSP**, which cost twice over: a
+  `script-src-elem` violation logged on every page load for every visitor --
+  noise that would mask a genuine CSP failure -- while Web Analytics silently
+  collected nothing despite being switched on. `script-src` now allows
+  `https://static.cloudflareinsights.com` (both CSP variants in
+  `crates/shell-web/Dockerfile`). If the beacon is unwanted, turn injection off
+  in the dashboard instead and revert that entry.
+
+What was checked, all green: DNS and edge reachability for all four hostnames,
+with every edge status matching its localhost origin; `/v1/me` identical through
+the edge; the live-room WebSocket upgrading with `101 Switching Protocols` at
+both edge and origin; a teacher publishing WHIP to `media.` (201, publisher
+connected, MediaMTX path `ready`); a student decoding real WHEP video (640x480,
+63 frames) ; and HLS through `stream.` serving master playlist, media playlist
+and a 99,979-byte `video/mp4` segment.
+
+Two things that look like faults and are not: `/v1/healthz` 404s at the edge
+**and** at the origin (it simply is not a route -- the backend serves
+`/healthz`), and `gap.mp4` in a media playlist returns 401. The latter is the
+placeholder MediaMTX lists against an `#EXT-X-GAP` entry; players skip those
+rather than fetch them, so fetching one proves nothing.
+
 ## How to change ingress
 
 Ingress is edited in the dashboard (Zero Trust → Networks → Tunnels), or via the API.

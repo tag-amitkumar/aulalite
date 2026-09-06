@@ -139,7 +139,23 @@ server {
     # scripts stay disabled. Production startup separately requires HTTPS media
     # endpoints; broad HTTPS/WSS connect/media sources accommodate customer
     # Firebase and MediaMTX hostnames without weakening script execution.
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; frame-src 'self' https: blob:; manifest-src 'self'; form-action 'self'" always;
+    #
+    # static.cloudflareinsights.com is Cloudflare's Web Analytics beacon. The
+    # zone has automatic injection enabled, so the EDGE rewrites every HTML
+    # response to add <script src="https://static.cloudflareinsights.com/
+    # beacon.min.js/...">. Our origin never emits it -- verified by diffing the
+    # origin and edge HTML, and note a plain curl does NOT reproduce it:
+    # Cloudflare only injects when the request looks like a browser navigation
+    # (Accept: text/html + a browser UA).
+    #
+    # Without this entry the injected script is blocked, which cost twice: a
+    # script-src-elem violation logged on EVERY page load for every visitor --
+    # noise that would mask a real CSP failure -- and Web Analytics silently
+    # collecting nothing while appearing to be on. Allowlisting reconciles the
+    # policy with what the account is already configured to do. The alternative
+    # is to turn injection off (Cloudflare dashboard -> Web Analytics), which
+    # needs no code change; do that instead if the beacon is unwanted.
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com https://static.cloudflareinsights.com; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; frame-src 'self' https: blob:; manifest-src 'self'; form-action 'self'" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
@@ -151,7 +167,7 @@ server {
     # non-frameable. Tenant-specific LMS allowlists remain enforced by the
     # signed LTI issuer/client/deployment checks before this route is reached.
     location = /lti/landing {
-        add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors https:; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; frame-src 'self' https: blob:; manifest-src 'self'; form-action 'self'" always;
+        add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors https:; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com https://static.cloudflareinsights.com; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; frame-src 'self' https: blob:; manifest-src 'self'; form-action 'self'" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header Permissions-Policy "camera=(self), microphone=(self), display-capture=(self), fullscreen=(self), geolocation=()" always;
