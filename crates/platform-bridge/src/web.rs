@@ -238,9 +238,73 @@ impl PlatformBridge for WebBridge {
     }
 }
 
+/// Turn a Firebase `auth/*` error code into something worth showing a person.
+///
+/// Returns `None` for codes we have no better words for, so the caller falls
+/// back to a generic message rather than inventing one.
+///
+/// Wrong-password, no-such-user and malformed-email deliberately collapse into
+/// ONE message. Distinguishing them tells an attacker which addresses have
+/// accounts, which is a free account-enumeration oracle on a public login form;
+/// the person who genuinely mistyped is helped just as much by the combined
+/// wording.
+fn firebase_auth_message(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "auth/invalid-credential"
+        | "auth/invalid-login-credentials"
+        | "auth/wrong-password"
+        | "auth/user-not-found"
+        | "auth/invalid-email" => "the email or password is incorrect",
+        "auth/user-disabled" => "this account has been disabled",
+        "auth/too-many-requests" => {
+            "too many attempts from this device. Wait a few minutes and try again"
+        }
+        "auth/network-request-failed" => "the network request failed. Check your connection",
+        "auth/email-already-in-use" => "an account already exists for this email",
+        "auth/weak-password" => "that password is too short",
+        "auth/requires-recent-login" => "please sign in again to continue",
+        "auth/popup-closed-by-user" | "auth/cancelled-popup-request" => "the sign-in was cancelled",
+        "auth/operation-not-allowed" => {
+            "this sign-in method is not enabled for this workspace"
+        }
+        _ => return None,
+    })
+}
+
 impl From<JsValue> for BridgeError {
+    /// Firebase rejections arrive as a JS error object. Formatting it with
+    /// `{:?}` put the RAW Rust debug of that object in front of the user --
+    /// measured on the live login form, a wrong password rendered as
+    /// `Sign in failed: io: JsValue(FirebaseError: Firebase: Error
+    /// (auth/invalid-credential))`. That is noise to a person and detail to an
+    /// attacker, and `Io` even prefixes it with "io: " because these are not
+    /// I/O failures at all.
+    ///
+    /// Read the structured `code` instead and map it. Anything unrecognised
+    /// becomes a neutral sentence -- never the debug dump.
     fn from(value: JsValue) -> Self {
-        BridgeError::Io(format!("{value:?}"))
+        let code = js_sys::Reflect::get(&value, &JsValue::from_str("code"))
+            .ok()
+            .and_then(|c| c.as_string())
+            .unwrap_or_default();
+
+        if code.starts_with("auth/") {
+            return BridgeError::Authentication(
+                firebase_auth_message(&code)
+                    .unwrap_or("sign-in could not be completed. Please try again")
+                    .to_string(),
+            );
+        }
+
+        // Not an auth error: keep the message, drop the debug wrapper. The raw
+        // object still reaches the console for diagnosis.
+        web_sys::console::warn_1(&value);
+        let message = js_sys::Reflect::get(&value, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|m| m.as_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "an unexpected error occurred".to_string());
+        BridgeError::Io(message)
     }
 }
 
