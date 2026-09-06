@@ -19,4 +19,4 @@ dotenvy = { workspace = true }
 dioxus-ssr = "=0.7.10"
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
