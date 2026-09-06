@@ -286,7 +286,34 @@ pub async fn end_class(
     .await
 }
 
-/// Ends all `live` sessions whose `actual_started_at + duration_minutes + 30min`
+/// Floor, in minutes, on how long a STARTED live class may run before the
+/// auto-end sweep is allowed to terminate it.
+///
+/// The sweep keys off the session's booked `duration_minutes`, and `start-now`
+/// books 60 by default, so a class that ran long was force-ended at 90 minutes
+/// (60 + the 30-minute grace) with the teacher still presenting. A booked
+/// duration is a scheduling hint, not a hard stop.
+///
+/// Applied as a FLOOR rather than a replacement: a session booked for longer
+/// than this keeps its own longer window. Abandoned rooms are still reclaimed,
+/// just at 180 + 30 minutes instead of 90.
+///
+/// Everything else in the live path already outlives this window and is
+/// deliberately left alone -- viewer JWT and publish nonce at 4h, the go-live
+/// window at 4h, Redis presence/poll/breakout at 6-24h. Short timeouts that
+/// govern retries, ICE gathering and health probes are unrelated to session
+/// lifetime and unchanged.
+pub const MIN_LIVE_SESSION_MINUTES: i64 = 180;
+
+/// Grace added on top of the effective duration before the auto-end sweep
+/// reclaims a still-`live` row. Exported so the join window can use the SAME
+/// deadline: a class the sweep is still willing to keep alive must remain
+/// joinable, or a teacher who runs long has students locked out of a room that
+/// is still publishing.
+pub const AUTO_END_GRACE_MINUTES: i64 = 30;
+
+/// Ends all `live` sessions whose
+/// `actual_started_at + max(duration_minutes, MIN_LIVE_SESSION_MINUTES) + AUTO_END_GRACE_MINUTES`
 /// is in the past. Returns `(id, tenant_id)` tuples for ended sessions, so
 /// callers can emit audit events.
 pub async fn sweep_auto_end(pool: &PgPool) -> sqlx::Result<Vec<(Uuid, Uuid)>> {
@@ -301,9 +328,12 @@ pub async fn sweep_auto_end(pool: &PgPool) -> sqlx::Result<Vec<(Uuid, Uuid)>> {
                 publish_nonce_expires_at = NULL
           WHERE status = 'live'
             AND actual_started_at IS NOT NULL
-            AND actual_started_at + (duration_minutes + 30) * interval '1 minute' < now()
+            AND actual_started_at
+                + (GREATEST(duration_minutes, $1) + $2) * interval '1 minute' < now()
         RETURNING id, tenant_id",
     )
+    .bind(MIN_LIVE_SESSION_MINUTES as i32)
+    .bind(AUTO_END_GRACE_MINUTES as i32)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
