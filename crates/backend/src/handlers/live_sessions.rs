@@ -1396,6 +1396,45 @@ async fn end_class_t(
 const VIEWER_JWT_TTL: StdDuration = StdDuration::from_secs(4 * 60 * 60);
 const JOIN_WINDOW_BEFORE: i64 = 5; // minutes
 const JOIN_WINDOW_AFTER_END: i64 = 15; // minutes
+
+/// Whether `/join` may be served for a session in `status` at `now`.
+///
+/// The window gates entry to a **live room**: it stops people walking into a
+/// lobby days early, and stops them re-entering a room whose media plane is
+/// gone. Everything it protects is live-only — the viewer JWT with MediaMTX
+/// read permissions is minted solely on the `"live"` branch of `join_inner`.
+///
+/// A session that has **ended** is not an entry, it is a replay, and replay is
+/// already authorised by `caller_can_read_course` a few lines above. Applying
+/// the live window to it made every recording unwatchable 15 minutes after
+/// class: `/join` answered `400 session window closed`, and because the client
+/// asks `/join` for the branch to render (it carries `has_recording`), the
+/// replay page never mounted at all. The recording itself was fine and the
+/// Ended branch already knows how to show it.
+///
+/// Deliberately unbounded afterwards: how long a recording stays watchable is a
+/// retention decision, enforced by the retention janitor deleting the object,
+/// not something to re-litigate with a clock here. Once the row is gone
+/// `has_recording` is false and the Ended branch says so.
+///
+/// `"cancelled"` is intentionally NOT exempt: that class never happened and has
+/// nothing to replay, so the ordinary window still applies.
+fn join_window_open(
+    status: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    starts_at: chrono::DateTime<chrono::Utc>,
+    duration_minutes: i64,
+    actual_ended_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if status == "ended" {
+        return true;
+    }
+    let open_from = starts_at - chrono::Duration::minutes(JOIN_WINDOW_BEFORE);
+    let open_until = actual_ended_at
+        .unwrap_or(starts_at + chrono::Duration::minutes(duration_minutes))
+        + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END);
+    now >= open_from && now <= open_until
+}
 const LIVE_HEALTH_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
 #[derive(serde::Serialize)]
@@ -1723,13 +1762,13 @@ async fn join_inner(
         return Err(ApiError::Forbidden);
     }
 
-    let now = chrono::Utc::now();
-    let join_open_from = session.starts_at - chrono::Duration::minutes(JOIN_WINDOW_BEFORE);
-    let join_open_until = session
-        .actual_ended_at
-        .unwrap_or(session.starts_at + chrono::Duration::minutes(session.duration_minutes as i64))
-        + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END);
-    if now < join_open_from || now > join_open_until {
+    if !join_window_open(
+        &session.status,
+        chrono::Utc::now(),
+        session.starts_at,
+        session.duration_minutes as i64,
+        session.actual_ended_at,
+    ) {
         return Err(ApiError::SessionWindowClosed("outside join window".into()));
     }
 
@@ -5056,6 +5095,99 @@ mod health_tests {
         let screen = screen_stream_health(path_status_timeout());
         assert_eq!(screen.status, LiveHealthStatus::Unknown);
         assert_eq!(screen.detail, "Could not check screen share path");
+    }
+
+    #[test]
+    fn ended_sessions_stay_joinable_so_recordings_stay_viewable() {
+        // The bug: a class that ended long ago answered 400 on /join, and since
+        // /join is what tells the client which branch to render, the replay
+        // page never mounted even though the recording was intact.
+        let starts = chrono::Utc::now() - chrono::Duration::days(30);
+        let ended = starts + chrono::Duration::minutes(60);
+        assert!(join_window_open(
+            "ended",
+            chrono::Utc::now(),
+            starts,
+            60,
+            Some(ended)
+        ));
+        // Still true a year later -- retention decides when a recording stops
+        // being watchable, not the join clock.
+        assert!(join_window_open(
+            "ended",
+            ended + chrono::Duration::days(365),
+            starts,
+            60,
+            Some(ended)
+        ));
+    }
+
+    #[test]
+    fn live_room_entry_is_still_time_boxed() {
+        // The exemption must not turn into a blanket bypass: everything that is
+        // not a replay keeps the original window.
+        let starts = chrono::Utc::now();
+        let ended = starts + chrono::Duration::minutes(60);
+
+        // Too early for the lobby.
+        assert!(!join_window_open(
+            "scheduled",
+            starts - chrono::Duration::minutes(JOIN_WINDOW_BEFORE + 1),
+            starts,
+            60,
+            None
+        ));
+        // Just inside the pre-roll.
+        assert!(join_window_open(
+            "scheduled",
+            starts - chrono::Duration::minutes(JOIN_WINDOW_BEFORE - 1),
+            starts,
+            60,
+            None
+        ));
+        // Live, mid-class.
+        assert!(join_window_open(
+            "live",
+            starts + chrono::Duration::minutes(30),
+            starts,
+            60,
+            None
+        ));
+        // Live row left stale long after the scheduled end: the media plane is
+        // gone, so entry must still be refused.
+        assert!(!join_window_open(
+            "live",
+            ended + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END + 1),
+            starts,
+            60,
+            None
+        ));
+        // A cancelled class never happened and has nothing to replay.
+        assert!(!join_window_open(
+            "cancelled",
+            ended + chrono::Duration::days(1),
+            starts,
+            60,
+            None
+        ));
+    }
+
+    #[test]
+    fn join_window_uses_actual_end_when_a_class_runs_over() {
+        // A class that ran past its scheduled duration must stay joinable for
+        // the grace period after it ACTUALLY ended, not after it was booked to.
+        let starts = chrono::Utc::now() - chrono::Duration::minutes(120);
+        let actual_end = starts + chrono::Duration::minutes(110);
+        let just_after = actual_end + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END - 1);
+        assert!(join_window_open(
+            "live",
+            just_after,
+            starts,
+            60,
+            Some(actual_end)
+        ));
+        // Without the actual end, the same instant is far outside the window.
+        assert!(!join_window_open("live", just_after, starts, 60, None));
     }
 
     #[test]
