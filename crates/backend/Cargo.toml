@@ -271,6 +271,6 @@ percent-encoding = "2"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 http-body-util = "0.1"
 tower = { workspace = true }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tempfile = "3"
