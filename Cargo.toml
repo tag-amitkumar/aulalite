@@ -50,7 +50,7 @@ fred = { version = "10", default-features = false, features = ["subscriber-clien
 rand = "0.9"
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.11"
-sha1 = "0.10"
+sha1 = "0.11"
 hmac = "0.13"
 ring = "0.17"
 dioxus-free-icons = { version = "0.10", default-features = false, features = ["lucide"] }

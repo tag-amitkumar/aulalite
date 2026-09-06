@@ -902,7 +902,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -959,7 +959,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha1 0.10.6",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",
@@ -3995,7 +3995,7 @@ dependencies = [
  "http 1.4.0",
  "httpdate",
  "mime",
- "sha1 0.10.6",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -7283,9 +7283,9 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -8514,7 +8514,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.6",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "thiserror 1.0.69",
  "utf-8",
 ]
@@ -8531,7 +8531,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "thiserror 2.0.20",
  "utf-8",
 ]
@@ -8550,7 +8550,7 @@ dependencies = [
  "native-tls",
  "rand 0.9.4",
  "rustls 0.23.40",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "thiserror 2.0.20",
  "utf-8",
 ]
@@ -8567,7 +8567,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "thiserror 2.0.20",
 ]
 
