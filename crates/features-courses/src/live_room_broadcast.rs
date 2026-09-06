@@ -170,6 +170,9 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
     // starts, not completions, is what makes a poll that was already in flight
     // when the publisher landed come back correctly marked as pre-publisher --
     // it queried a media server that had no path yet, however late it lands.
+    // Relay reachability. Probed once per live entry; informational only, so a
+    // slow or failed probe must never gate publishing.
+    let relay_status = use_signal(|| crate::live_room_health::RelayStatus::Checking);
     let health_poll_seq = use_signal(|| 0u64);
     let health_snapshot_seq = use_signal(|| None::<u64>);
     let publisher_seen_at = use_signal(|| None::<u64>);
@@ -476,6 +479,39 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
                 (false, Some(_)) => seen_at.set(None),
                 _ => {}
             }
+        });
+    }
+
+    // Probe the relay once the room is live.
+    //
+    // Runs AFTER go-live rather than on mount because `current_ice_servers` is
+    // populated from the go-live response -- probing earlier would test an
+    // empty list and always report NotConfigured.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let state_relay = state;
+        let mut relay_w = relay_status;
+        let probed: std::rc::Rc<std::cell::Cell<bool>> =
+            use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+        use_effect(move || {
+            let is_live = matches!(*state_relay.read(), PublishState::Live { .. });
+            if !is_live {
+                // Re-arm so a later class re-probes: the relay may have been
+                // fixed (or broken) since.
+                probed.set(false);
+                return;
+            }
+            if probed.get() {
+                return;
+            }
+            probed.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                let verdict = crate::live_room_ice::probe_relay().await;
+                web_sys::console::log_1(
+                    &format!("[live_room_relay] relay probe: {verdict:?}").into(),
+                );
+                relay_w.set(verdict);
+            });
         });
     }
 
@@ -1067,6 +1103,7 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
             publish_active,
             screen_publish_active,
             socket_status: crate::live_room_health::SocketHealthStatus::from(*socket_status.read()),
+            relay: *relay_status.read(),
             quality: *quality.read(),
             video_error,
         },

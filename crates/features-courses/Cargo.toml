@@ -48,6 +48,9 @@ web-sys = { version = "0.3", features = [
     # RtcRtpSender::get_capabilities() returns Option<RtcRtpCapabilities>.
     "RtcRtpCapabilities",
     "RtcRtpEncodingParameters",
+    # The relay preflight gathers with iceTransportPolicy:"relay"; the setter is
+    # gated on the enum type, same web-sys trap as RtcIceGatheringState.
+    "RtcIceTransportPolicy","RtcDataChannel","RtcDataChannelInit","RtcPeerConnectionIceEvent",
     "MediaStream","MediaStreamTrack","MediaDevices","MediaStreamConstraints","DisplayMediaStreamConstraints",
     # `MediaStreamTrack::ready_state()` returns MediaStreamTrackState, and
     # web-sys gates a method on the features of the types in its signature --

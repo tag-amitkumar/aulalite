@@ -145,6 +145,61 @@ impl SocketHealthStatus {
     }
 }
 
+/// Result of asking the browser whether it can actually allocate a TURN relay.
+///
+/// This is the difference between "the class works" and "the class works for
+/// people on this network". WebRTC media never crosses the Cloudflare Tunnel --
+/// the tunnel carries only the HTTP signalling -- so a participant who is not
+/// on MediaMTX's own network can only be reached through a relay. When the
+/// relay is dead the publish still succeeds locally and then times out for
+/// everyone else, which previously surfaced only as a WHIP connect timeout
+/// minutes later, with nothing naming the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayStatus {
+    /// The probe has not finished (or has not started).
+    Checking,
+    /// A relay candidate was gathered: remote participants can be reached.
+    Available,
+    /// TURN servers are configured but none would allocate.
+    Unavailable,
+    /// No TURN server is configured at all.
+    NotConfigured,
+}
+
+/// Map a relay probe onto a health row.
+///
+/// Deliberately never `Error`. A dead relay does not break the class for anyone
+/// on this network, and promoting it to Error would drag the whole strip red
+/// during a lesson that is working -- exactly the false alarm the `NotReady`
+/// work removed. `Warning` says "this is degraded and you should know", which
+/// is the truth.
+pub fn relay_health_item(status: RelayStatus) -> HealthItem {
+    match status {
+        RelayStatus::Checking => HealthItem::new(
+            "Relay",
+            HealthStatus::NotReady,
+            "Checking whether remote students can be reached",
+        ),
+        RelayStatus::Available => HealthItem::new(
+            "Relay",
+            HealthStatus::Ok,
+            "A TURN relay is reachable, so students on other networks can connect",
+        ),
+        RelayStatus::Unavailable => HealthItem::new(
+            "Relay",
+            HealthStatus::Warning,
+            "No TURN relay could be allocated. Students on this network are fine; \
+             anyone joining from elsewhere will not receive video.",
+        ),
+        RelayStatus::NotConfigured => HealthItem::new(
+            "Relay",
+            HealthStatus::Warning,
+            "No TURN relay is configured. Students on this network are fine; \
+             anyone joining from elsewhere will not receive video.",
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrowserRoomHealth {
     pub devices_captured: bool,
@@ -169,6 +224,8 @@ pub struct BrowserRoomHealth {
     pub publish_active: bool,
     pub screen_publish_active: bool,
     pub socket_status: SocketHealthStatus,
+    /// Whether a TURN relay could actually be allocated (see [`RelayStatus`]).
+    pub relay: RelayStatus,
     pub quality: NetQuality,
     pub video_error: Option<String>,
 }
@@ -198,6 +255,7 @@ pub struct LiveRoomHealthModel {
     pub stream: HealthItem,
     pub screen: HealthItem,
     pub room: HealthItem,
+    pub relay: HealthItem,
     pub recording: HealthItem,
     pub quality: NetQuality,
     pub checked_at: Option<String>,
@@ -240,6 +298,7 @@ pub fn merge_live_room_health(
         browser.socket_status.health_status(),
         browser.socket_status.detail(),
     );
+    let relay = relay_health_item(browser.relay);
     let recording = merge_recording_item(server);
 
     let overall_status = worst_status([
@@ -248,6 +307,7 @@ pub fn merge_live_room_health(
         stream.status,
         screen.status,
         room.status,
+        relay.status,
         recording.status,
     ]);
 
@@ -258,6 +318,7 @@ pub fn merge_live_room_health(
         stream,
         screen,
         room,
+        relay,
         recording,
         quality: browser.quality,
         checked_at: server.map(|health| health.checked_at.clone()),
@@ -420,6 +481,7 @@ pub fn LiveRoomHealthStrip(props: LiveRoomHealthStripProps) -> Element {
                 HealthStripItem { item: model.stream.clone() }
                 HealthStripItem { item: model.screen.clone() }
                 HealthStripItem { item: model.room.clone() }
+                HealthStripItem { item: model.relay.clone() }
                 HealthStripItem { item: model.recording.clone() }
             }
             div { class: "live-room-health-strip__quality",
@@ -529,6 +591,10 @@ pub fn LiveRoomDiagnosticsSheet(props: LiveRoomDiagnosticsSheetProps) -> Element
                 }
                 HealthCheckRow {
                     item: model.room.clone(),
+                    checked_at: Some(checked_at.clone()),
+                }
+                HealthCheckRow {
+                    item: model.relay.clone(),
                     checked_at: Some(checked_at.clone()),
                 }
                 HealthCheckRow {
@@ -698,6 +764,7 @@ mod tests {
             publish_active: true,
             screen_publish_active: false,
             socket_status: SocketHealthStatus::Connected,
+            relay: RelayStatus::Available,
             quality: NetQuality::Good,
             video_error: None,
         }
@@ -767,6 +834,64 @@ mod tests {
             HealthStatus::NotReady,
             HealthStatus::Warning | HealthStatus::Error
         ));
+    }
+
+    #[test]
+    fn a_dead_relay_warns_without_reddening_a_working_class() {
+        // The failure this row exists for: publishing succeeds on this network
+        // and then times out for everyone else, with nothing naming the cause.
+        // It must be visible -- but it must NOT read as Error, because the
+        // lesson genuinely works for the people already connected.
+        for dead in [RelayStatus::Unavailable, RelayStatus::NotConfigured] {
+            let mut browser = browser_health();
+            browser.relay = dead;
+            let model = merge_live_room_health(Some(&server_health()), browser);
+
+            assert_eq!(model.relay.status, HealthStatus::Warning, "{dead:?}");
+            assert_ne!(model.overall_status, HealthStatus::Error, "{dead:?}");
+            assert_eq!(model.overall_status, HealthStatus::Warning, "{dead:?}");
+            // The wording has to say who is affected, not just that something
+            // is wrong -- "relay unavailable" means nothing to a teacher.
+            let d = model.relay.detail.to_lowercase();
+            assert!(d.contains("elsewhere"), "must name who breaks: {d}");
+            assert!(d.contains("this network are fine"), "and who does not: {d}");
+        }
+    }
+
+    #[test]
+    fn a_working_relay_is_ok_and_the_probe_is_not_ready_until_it_answers() {
+        let mut browser = browser_health();
+        browser.relay = RelayStatus::Available;
+        assert_eq!(
+            merge_live_room_health(Some(&server_health()), browser).relay.status,
+            HealthStatus::Ok
+        );
+
+        // While the probe is in flight the row must not accuse anything: it
+        // ranks above Ok so it is visible, below Warning so it raises no alarm.
+        let mut browser = browser_health();
+        browser.relay = RelayStatus::Checking;
+        let model = merge_live_room_health(Some(&server_health()), browser);
+        assert_eq!(model.relay.status, HealthStatus::NotReady);
+        assert_eq!(model.overall_status, HealthStatus::NotReady);
+    }
+
+    #[test]
+    fn relay_row_is_rendered_in_the_strip() {
+        fn app() -> Element {
+            let mut browser = browser_health();
+            browser.relay = RelayStatus::Unavailable;
+            let model = merge_live_room_health(Some(&server_health()), browser);
+            rsx! { LiveRoomHealthStrip { model } }
+        }
+        let mut vdom = VirtualDom::new(app);
+        vdom.rebuild_in_place();
+        let html = dioxus_ssr::render(&vdom);
+        assert!(html.contains("Relay"), "relay row missing: {html}");
+        assert!(
+            html.contains("health-status--warning"),
+            "dead relay must render as a warning: {html}"
+        );
     }
 
     #[test]

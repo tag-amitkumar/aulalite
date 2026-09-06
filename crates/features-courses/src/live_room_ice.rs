@@ -326,8 +326,126 @@ mod imp {
     }
 }
 
+/// How long to wait for a relay candidate before calling the relay dead.
+///
+/// A working TURN answers in well under a second; a dead one surfaces as an
+/// `icecandidateerror` almost immediately (measured: code 701 on openrelay).
+/// This is only the backstop for a server that accepts the connection and then
+/// never replies, so it can be short -- the probe is informational and must not
+/// keep the strip in "Checking" for the first minute of a lesson.
+pub const RELAY_PROBE_TIMEOUT_MS: u32 = 6_000;
+
 #[cfg(target_arch = "wasm32")]
 pub use imp::*;
+
+#[cfg(target_arch = "wasm32")]
+mod relay_probe {
+    use super::RELAY_PROBE_TIMEOUT_MS;
+    use crate::live_room_health::RelayStatus;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{RtcConfiguration, RtcIceServer, RtcIceTransportPolicy, RtcPeerConnection};
+
+    /// Can this browser actually allocate a TURN relay right now?
+    ///
+    /// Gathers with `iceTransportPolicy: "relay"`, which suppresses host and
+    /// server-reflexive candidates entirely -- so anything that arrives came
+    /// from a TURN allocation, and arriving with nothing is proof the relay
+    /// cannot be used. Cheap: a data-channel offer, no media, no signalling,
+    /// nothing published.
+    ///
+    /// Uses the session's OWN ICE servers (`current_ice_servers`), not a
+    /// hard-coded list, so the row reports on the relay the room would really
+    /// use rather than on some other server that happens to work.
+    pub async fn probe_relay() -> RelayStatus {
+        let servers = crate::live_room_whip::current_ice_servers();
+        let turn: Vec<_> = servers
+            .iter()
+            .filter(|s| {
+                s.urls
+                    .iter()
+                    .any(|u| u.starts_with("turn:") || u.starts_with("turns:"))
+            })
+            .collect();
+        if turn.is_empty() {
+            return RelayStatus::NotConfigured;
+        }
+
+        let cfg = RtcConfiguration::new();
+        let arr = js_sys::Array::new();
+        for entry in &turn {
+            let urls = js_sys::Array::new();
+            for u in &entry.urls {
+                urls.push(&JsValue::from_str(u));
+            }
+            let s = RtcIceServer::new();
+            s.set_urls(&urls);
+            if let Some(u) = &entry.username {
+                s.set_username(u);
+            }
+            if let Some(c) = &entry.credential {
+                s.set_credential(c);
+            }
+            arr.push(&s);
+        }
+        cfg.set_ice_servers(&arr);
+        cfg.set_ice_transport_policy(RtcIceTransportPolicy::Relay);
+
+        let Ok(pc) = RtcPeerConnection::new_with_configuration(&cfg) else {
+            return RelayStatus::Unavailable;
+        };
+        // Closes the connection however we leave this function, including the
+        // early returns below -- an abandoned probe would hold its ICE agent
+        // and any allocation open for the life of the page.
+        let guard = super::imp::PcCloseGuard::new(pc.clone());
+
+        let found = std::rc::Rc::new(std::cell::Cell::new(false));
+        let cb = {
+            let found = found.clone();
+            Closure::<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>::new(
+                move |ev: web_sys::RtcPeerConnectionIceEvent| {
+                    if let Some(c) = ev.candidate() {
+                        if c.candidate().contains(" typ relay") {
+                            found.set(true);
+                        }
+                    }
+                },
+            )
+        };
+        pc.set_onicecandidate(Some(cb.as_ref().unchecked_ref()));
+
+        // A candidate-less offer gathers nothing, so give it a data channel.
+        let _dc = pc.create_data_channel("relay-probe");
+        let ok = async {
+            let offer = JsFuture::from(pc.create_offer()).await.ok()?;
+            let offer: web_sys::RtcSessionDescriptionInit = offer.unchecked_into();
+            JsFuture::from(pc.set_local_description(&offer)).await.ok()
+        }
+        .await;
+        if ok.is_none() {
+            pc.set_onicecandidate(None);
+            drop(guard);
+            return RelayStatus::Unavailable;
+        }
+
+        // Reuse the gathering wait already used by the publisher, then judge on
+        // what actually arrived rather than on whether gathering "completed":
+        // with a dead relay gathering completes promptly and empty.
+        let _ = super::imp::await_ice_gathering(&pc, RELAY_PROBE_TIMEOUT_MS).await;
+        let verdict = if found.get() {
+            RelayStatus::Available
+        } else {
+            RelayStatus::Unavailable
+        };
+        pc.set_onicecandidate(None);
+        drop(guard);
+        verdict
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub use relay_probe::probe_relay;
 
 #[cfg(test)]
 mod tests {
