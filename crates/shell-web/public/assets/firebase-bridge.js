@@ -72,7 +72,32 @@
     },
 
     async currentIdToken() {
-      const { auth } = await loadAuth();
+      const { auth, authModule } = await loadAuth();
+      // Firebase restores a PERSISTED session asynchronously. `getAuth()`
+      // resolves immediately but `auth.currentUser` stays null until that
+      // restore finishes, so reading it straight away reports "signed out" for
+      // a user who is signed in.
+      //
+      // That is not cosmetic: the auth bootstrap treats a null token as
+      // anonymous and redirects to /login, so every page load and every hard
+      // navigation bounced a signed-in Firebase user back to the login screen.
+      // It stayed hidden while the local-login bypass was on, because that path
+      // reads a token out of localStorage synchronously and returned first.
+      //
+      // Wait for the restore to settle before answering. `authStateReady()`
+      // exists from SDK 9.17; the listener below is the equivalent for older
+      // builds and resolves on the first state callback, which Firebase always
+      // fires once the initial restore completes (user or no user).
+      if (typeof auth.authStateReady === "function") {
+        await auth.authStateReady();
+      } else {
+        await new Promise((resolve) => {
+          const unsubscribe = authModule.onAuthStateChanged(auth, () => {
+            unsubscribe();
+            resolve();
+          });
+        });
+      }
       if (!auth.currentUser) {
         return null;
       }
