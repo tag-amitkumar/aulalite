@@ -572,10 +572,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Auto-end overdue live sessions every 60s.
+    // Auto-end overdue live sessions every 60 minutes.
+    //
+    // The sweep only reclaims rows already past their deadline
+    // (`MIN_LIVE_SESSION_MINUTES` + `AUTO_END_GRACE_MINUTES`), so a longer
+    // cadence never shortens a class -- it only delays reclaiming an abandoned
+    // one by up to one interval. Entry is gated by `join_window_open`, which
+    // evaluates the same deadline per request, so a stale `live` row is not
+    // joinable while it waits for the next tick.
     let pool_for_sweep = pool.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
