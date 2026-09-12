@@ -593,9 +593,10 @@ async fn main() -> anyhow::Result<()> {
     let pool_for_sweep = pool.clone();
     let mediamtx_for_sweep = mediamtx.clone();
     tokio::spawn(async move {
-        // `MediaMtxClient` must be in scope to call `path_status` through the
-        // `Arc<dyn ...>`; `PathStatus` is the verdict it returns.
-        use backend::services::mediamtx::{MediaMtxClient, PathStatus};
+        // `PathStatus` is the verdict the probe returns. The trait itself does
+        // NOT need importing: the value is an `Arc<dyn MediaMtxClient>`, so
+        // `path_status` resolves on the trait object directly.
+        use backend::services::mediamtx::PathStatus;
 
         const SWEEP_INTERVAL_SECS: u64 = 60;
         // A sampling loop can only honour the confirmation window if it

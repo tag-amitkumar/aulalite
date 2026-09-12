@@ -567,10 +567,12 @@ mod tests {
         // measured publisher-connected -> path-readable gap was ~2.1s. The
         // retry budget must clear that by a wide margin or viewers keep losing
         // the race they lost before.
-        assert!(PATH_READY_TIMEOUT_MS >= 10_000);
-        assert!(PATH_READY_RETRY_MS > 0);
+        // `const` blocks: every operand is a compile-time constant, so this
+        // belongs at compile time rather than posing as a runtime check.
+        const { assert!(PATH_READY_TIMEOUT_MS >= 10_000) };
+        const { assert!(PATH_READY_RETRY_MS > 0) };
         // At least a handful of attempts inside the budget.
-        assert!(PATH_READY_TIMEOUT_MS / PATH_READY_RETRY_MS >= 8);
+        const { assert!(PATH_READY_TIMEOUT_MS / PATH_READY_RETRY_MS >= 8) };
     }
 
     #[test]
@@ -581,8 +583,13 @@ mod tests {
         // as transient. Re-introducing a connect budget here would restore the
         // bug, so this file must not regain such a constant.
         let src = include_str!("live_room_ice.rs");
+        // Built from fragments on purpose. Spelled as one literal, the needle
+        // occurs in THIS line, so `src.contains` matched the guard itself and
+        // the assertion could never pass -- it reported the bug it was written
+        // to catch, whether or not the constant existed.
+        let needle = concat!("CONNECT", "_TIMEOUT");
         assert!(
-            !src.contains("CONNECT_TIMEOUT"),
+            !src.contains(needle),
             "a publish/connect timeout constant is back in live_room_ice.rs"
         );
         // The gathering bound is NOT a connect timeout and must stay: it only

@@ -117,10 +117,7 @@ pub fn CatalogView(on_joined: EventHandler<String>) -> Element {
                             { catalog_card(
                                 course,
                                 joining.read().as_deref() == Some(course.course_id.as_str()),
-                                EventHandler::new({
-                                    let join = join.clone();
-                                    join
-                                }),
+                                EventHandler::new(join.clone()),
                             ) }
                         }
                     }

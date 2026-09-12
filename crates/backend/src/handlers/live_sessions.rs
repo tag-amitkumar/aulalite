@@ -1473,6 +1473,17 @@ fn join_window_open(
     if status == "ended" {
         return true;
     }
+    // A cancelled class never happened: nothing to join, nothing to replay.
+    //
+    // This MUST be checked explicitly now. It used to fall out of the window
+    // arithmetic for free -- a cancelled row aged past `booked duration +
+    // grace` and the window closed on it. Removing that upper bound (correctly,
+    // so a running class is never cut off) also removed the only thing refusing
+    // a cancelled row, leaving it joinable forever. Status is the gate here, so
+    // the gate has to name this status.
+    if status == "cancelled" {
+        return false;
+    }
     let open_from = starts_at - chrono::Duration::minutes(JOIN_WINDOW_BEFORE);
     // `duration_minutes` is a scheduling hint and is deliberately NOT a bound
     // on entry.
@@ -1498,6 +1509,32 @@ fn join_window_open(
     }
 }
 const LIVE_HEALTH_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+
+/// How often the server sends an unsolicited WebSocket Ping on a live-room
+/// socket.
+///
+/// This exists because the room socket can be legitimately silent in the
+/// SERVER->CLIENT direction for a long time. A client heartbeat only writes a
+/// Redis key (`presence_heartbeat`) and broadcasts nothing, so a class where
+/// nobody chats, raises a hand, votes or joins produces no downstream frames at
+/// all -- while the teacher is presenting perfectly happily.
+///
+/// nginx gives this route `proxy_read_timeout 3600s`, and that timer resets
+/// only on traffic FROM the upstream, so client heartbeats do not hold it open:
+/// an hour of server silence closed the socket. The client now reconnects
+/// indefinitely, so this never ended a class -- it just dropped chat and
+/// presence for the length of a reconnect, on a cadence no one could explain.
+///
+/// A Ping is the right instrument: it is a single control frame, browsers
+/// answer it automatically with a Pong (no client code required), and it is
+/// exactly the keepalive every proxy in the path is looking for. Thirty seconds
+/// sits far below `proxy_read_timeout`, matches the `tcpKeepAlive: 30s` on the
+/// Cloudflare ingress, and costs one frame per client per half minute.
+///
+/// This is a TRANSPORT keepalive and carries no session semantics: it cannot
+/// end a class, and a class whose socket is gone entirely is still live for as
+/// long as the teacher keeps publishing.
+const WS_SERVER_PING_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
 #[derive(serde::Serialize)]
 pub struct JoinResponse {
@@ -3176,8 +3213,25 @@ async fn run_socket(
         }
     }
 
+    // Transport keepalive. See `WS_SERVER_PING_INTERVAL`: without downstream
+    // frames, nginx's `proxy_read_timeout` closes an otherwise healthy socket
+    // in a quiet class. Browsers Pong automatically, and an incoming Pong falls
+    // through the `_ => {}` arm below.
+    let mut ping_interval = tokio::time::interval(WS_SERVER_PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
+            _ = ping_interval.tick() => {
+                // A failed send means the peer is gone; stop rather than spin.
+                if sender
+                    .send(axum::extract::ws::Message::Ping(Vec::<u8>::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(axum::extract::ws::Message::Text(t))) => {

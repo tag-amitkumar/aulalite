@@ -125,6 +125,13 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
         let session_id = session_id_for_poll.clone();
         let poll_role = poll_role.clone();
         async move {
+            // On wasm32 -- the target that actually serves students -- this is
+            // a real loop: it awaits the poll interval and comes back, and the
+            // hidden-tab branch below `continue`s. On host builds the body ends
+            // in `return` by design, so an SSR render or a unit test runs one
+            // iteration instead of spinning forever. Clippy only ever sees the
+            // host cfg, where that reads as a loop that cannot loop.
+            #[allow(clippy::never_loop)]
             loop {
                 // A backgrounded tab asks nothing. Nobody is reading the lobby,
                 // so a request now buys no one anything; when the tab comes

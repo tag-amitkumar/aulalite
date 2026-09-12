@@ -1656,7 +1656,7 @@ fn render_webrtc(
                             let main_url = retry_main_url.clone();
                             let viewer_jwt = retry_viewer_jwt.clone();
                             spawn(async move {
-                                let result = if let Some(mut session) = session {
+                                let result = if let Some(session) = session {
                                     attach_main_unguarded(session, &main_url, &viewer_jwt).await
                                 } else {
                                     crate::live_room_native::view(

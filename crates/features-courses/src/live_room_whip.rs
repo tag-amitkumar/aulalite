@@ -763,7 +763,7 @@ mod tests {
     fn send_encoding_plan_is_a_single_full_resolution_layer_by_default() {
         // MediaMTX does no layer selection, so offering the ladder produces a
         // multi-VP8 path that a one-m-line WHEP viewer cannot reliably consume.
-        assert!(!SIMULCAST_ENABLED, "default must stay off against MediaMTX");
+        const { assert!(!SIMULCAST_ENABLED, "default must stay off against MediaMTX") };
         let plan = send_encoding_plan();
         assert_eq!(plan.len(), 1, "one encoding => one video track on the path");
         assert_eq!(plan[0].scale, 1.0, "viewers must get full resolution");

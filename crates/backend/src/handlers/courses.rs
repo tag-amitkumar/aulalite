@@ -588,7 +588,7 @@ async fn modules_with_lessons_inner(
     // visibility; learners get titles/order (so outlines and lock reasons
     // still render) with bodies and media stripped.
     let is_staff = db::courses::caller_can_staff_course(
-        &pool,
+        pool,
         id,
         ctx.user_id,
         ctx.tenant_id,
