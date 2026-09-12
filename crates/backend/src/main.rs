@@ -572,41 +572,165 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Auto-end overdue live sessions every 60 minutes.
+    // Reclaim live sessions whose PUBLISHER IS GENUINELY GONE.
     //
-    // The sweep only reclaims rows already past their deadline
-    // (`MIN_LIVE_SESSION_MINUTES` + `AUTO_END_GRACE_MINUTES`), so a longer
-    // cadence never shortens a class -- it only delays reclaiming an abandoned
-    // one by up to one interval. Entry is gated by `join_window_open`, which
-    // evaluates the same deadline per request, so a stale `live` row is not
-    // joinable while it waits for the next tick.
+    // There is deliberately NO maximum live-class duration. This sweep never
+    // looks at how long a class has been running. It asks the media server
+    // whether a publisher is still present on each live session's path and
+    // only ends a session once the publisher has been CONTINUOUSLY absent for
+    // `PUBLISHER_GONE_GRACE_MINUTES`. A teacher who is still publishing is
+    // never ended by this loop, at any age.
+    //
+    // This replaces a wall-clock rule (`actual_started_at + duration + grace`)
+    // that force-ended healthy classes mid-lesson. Raising that deadline only
+    // moved the wall; keying on real disconnection removes it.
+    //
+    // Cadence is the SAMPLING RATE for `publisher_last_seen_at`, not a
+    // deadline check, so it must stay well under the confirmation window. At a
+    // coarser interval than the window, a publisher that dropped just before a
+    // tick would be ended having been absent for far less than the window --
+    // the window would stop meaning what it says.
     let pool_for_sweep = pool.clone();
+    let mediamtx_for_sweep = mediamtx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        // `MediaMtxClient` must be in scope to call `path_status` through the
+        // `Arc<dyn ...>`; `PathStatus` is the verdict it returns.
+        use backend::services::mediamtx::{MediaMtxClient, PathStatus};
+
+        const SWEEP_INTERVAL_SECS: u64 = 60;
+        // A sampling loop can only honour the confirmation window if it
+        // samples several times inside it.
+        debug_assert!(
+            SWEEP_INTERVAL_SECS * 4
+                <= (backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES as u64) * 60,
+            "sweep must sample well inside the publisher-absence window"
+        );
+
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match backend::db::live_sessions::sweep_auto_end(&pool_for_sweep).await {
-                Ok(ended) if !ended.is_empty() => {
-                    tracing::info!(count = ended.len(), "auto-ended overdue sessions");
-                    // Reconcile attendance for each auto-ended session: close any
-                    // rows still open (dropped sockets) so their final segment is
-                    // counted. `sweep_auto_end` sets actual_ended_at = now(), so we
-                    // finalize up to now() (passing None). Best-effort per session.
-                    for (session_id, _tenant_id) in ended {
-                        if let Err(e) = backend::db::attendance::finalize_open_for_session(
+
+            let candidates =
+                match backend::db::live_sessions::list_live_for_sweep(&pool_for_sweep).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!(?e, "live sweep: could not list live sessions");
+                        continue;
+                    }
+                };
+
+            for candidate in candidates {
+                let session_id = candidate.id;
+
+                // Is a publisher on the path right now?
+                //
+                // `None` = INCONCLUSIVE. A transport error means the media
+                // server is unreachable or restarting, which says nothing
+                // about the teacher. Treating that as "gone" would end every
+                // live class on the platform the moment MediaMTX bounced, so
+                // an inconclusive probe leaves the absence clock untouched and
+                // waits for the next tick.
+                let publishing: Option<bool> = match candidate.main_path.as_deref() {
+                    Some(path) => match mediamtx_for_sweep.path_status(path).await {
+                        Ok(PathStatus::Active) => Some(true),
+                        Ok(PathStatus::Inactive) => Some(false),
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                %session_id,
+                                path,
+                                "live sweep: media server probe failed; \
+                                 leaving the absence clock untouched"
+                            );
+                            None
+                        }
+                    },
+                    // Live row with no path recorded: the teacher pressed
+                    // Start but never reached go-live, so nothing can be
+                    // publishing. Seeded from `actual_started_at` below, which
+                    // is what reclaims a room that never got on air.
+                    None => Some(false),
+                };
+
+                match publishing {
+                    // Publisher present: refresh the clock. The absence window
+                    // therefore only ever measures a genuine, CONTINUOUS
+                    // disconnection -- a blip that recovers before the next
+                    // tick resets it entirely.
+                    Some(true) => {
+                        if let Err(e) = backend::db::live_sessions::mark_publisher_seen(
                             &pool_for_sweep,
                             session_id,
-                            None,
                         )
                         .await
                         {
-                            tracing::warn!(?e, %session_id, "attendance finalize on sweep failed");
+                            tracing::warn!(?e, %session_id, "live sweep: mark publisher seen failed");
                         }
                     }
+
+                    // Publisher absent: start the clock if this is the first
+                    // observation, then end the session only if the window has
+                    // fully elapsed. `end_if_publisher_gone` re-checks the
+                    // window inside the UPDATE, so a publisher that returned
+                    // between the probe and the write is not cut off.
+                    Some(false) => {
+                        if let Err(e) = backend::db::live_sessions::seed_publisher_absence(
+                            &pool_for_sweep,
+                            session_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(?e, %session_id, "live sweep: seed absence failed");
+                            continue;
+                        }
+
+                        match backend::db::live_sessions::end_if_publisher_gone(
+                            &pool_for_sweep,
+                            session_id,
+                            backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::info!(
+                                    %session_id,
+                                    grace_minutes =
+                                        backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+                                    "ended live session: publisher confirmed gone"
+                                );
+                                // Reconcile attendance: close any rows still
+                                // open (dropped sockets) so the final segment
+                                // is counted. The row's `actual_ended_at` is
+                                // now(), so finalize up to now() (None).
+                                if let Err(e) =
+                                    backend::db::attendance::finalize_open_for_session(
+                                        &pool_for_sweep,
+                                        session_id,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        ?e,
+                                        %session_id,
+                                        "attendance finalize on sweep failed"
+                                    );
+                                }
+                            }
+                            // Absent, but still inside the window: leave it
+                            // live so a reconnecting teacher walks back into
+                            // the same class.
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(?e, %session_id, "live sweep: end failed")
+                            }
+                        }
+                    }
+
+                    None => {}
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(?e, "sweep_auto_end failed"),
             }
         }
     });

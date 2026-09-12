@@ -1069,10 +1069,77 @@ async fn transient_banner_delay() {
     crate::live_room_native::delay(5_000).await;
 }
 
-/// Re-attach the main WHEP viewer to `url` (the breakout sub-room feed while
-/// assigned, or the main-room feed on return / close), then wire the resulting
-/// remote stream onto the `#live-room-main-video` element. No-op when the
-/// session aggregate is absent (SSR) or `url` is empty.
+/// Does this WHEP failure mean "your credential is no longer accepted"?
+///
+/// MediaMTX answers an expired or rejected viewer JWT with 401/403 (the token
+/// travels as the HTTP Basic password; see `live_room_whep::view`). Everything
+/// else -- 404 for a path that is not ready, an ICE failure, a transport error
+/// -- is NOT an auth problem and must not trigger a token refresh, or a
+/// genuinely broken network would spin on `/join`.
+fn is_expired_viewer_credential(err: &str) -> bool {
+    err.contains("WHEP returned 401") || err.contains("WHEP returned 403")
+}
+
+/// Mint a FRESH viewer JWT by re-asking the server to join.
+///
+/// The token handed to the room at mount has a fixed TTL (`VIEWER_JWT_TTL`,
+/// 4h) while a live class has NO maximum duration. In a class that runs longer
+/// than the TTL, every re-attach -- a breakout move, a stream restart, a
+/// recovered network blip -- presented an expired credential, MediaMTX refused
+/// it, and the student's video stayed dead until they reloaded the page.
+///
+/// `POST /join` is the canonical way to get a new one: it re-mints on every
+/// call and a running class answers it with no upper bound (see the backend
+/// `join_window_open`). It performs no writes, so re-issuing it is a read.
+///
+/// Returns `None` if the refresh itself fails, so the caller can surface the
+/// ORIGINAL media error rather than masking it with a second one.
+async fn refresh_viewer_jwt(
+    mut session: Signal<crate::live_room_session::LiveRoomSession>,
+    used: &str,
+) -> Option<String> {
+    // Clone what the request needs under a SHORT borrow. Holding the signal's
+    // read guard across the await below is a generational-box double borrow as
+    // soon as any concurrent room event touches the session -- the same hazard
+    // documented on `attach_main_unguarded`.
+    let (api, session_id, current) = {
+        let guard = session.read();
+        (
+            guard.api().clone(),
+            guard.config().session_id.clone(),
+            guard.config().viewer_jwt.clone(),
+        )
+    };
+
+    // Another attach (main, screen, and each promoted student can all fail at
+    // once) may already have refreshed while we were failing. If the stored
+    // token has moved on from the one we just tried, reuse it instead of
+    // issuing a second `/join` for the same expiry.
+    if let Some(current) = current.filter(|c| c.as_str() != used) {
+        return Some(current);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct JoinRefresh {
+        viewer_jwt: Option<String>,
+    }
+
+    let resp: JoinRefresh = crate::api::fetch_json(
+        &api,
+        "POST",
+        &format!("/v1/sessions/{session_id}/join"),
+        Some(&serde_json::json!({})),
+    )
+    .await
+    .ok()?;
+
+    let fresh = resp.viewer_jwt?;
+    // Short write so later re-attaches start from the current credential
+    // rather than the one captured when the room mounted.
+    session.write().set_viewer_jwt(fresh.clone());
+    Some(fresh)
+}
+
 /// Attach the teacher's WHEP feed WITHOUT holding a `Signal` write guard
 /// across the handshake.
 ///
@@ -1089,7 +1156,26 @@ async fn transient_banner_delay() {
 ///
 /// So: open the viewer with NO guard, take a short synchronous write to store
 /// it, and close the viewer it replaced outside the guard as well.
+///
+/// Retries ONCE with a freshly minted viewer JWT when the credential is the
+/// thing that was refused; see [`refresh_viewer_jwt`].
 async fn attach_main_unguarded(
+    session: Signal<crate::live_room_session::LiveRoomSession>,
+    url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    match attach_main_once(session, url, viewer_jwt).await {
+        Err(e) if is_expired_viewer_credential(&e) => {
+            let Some(fresh) = refresh_viewer_jwt(session, viewer_jwt).await else {
+                return Err(e);
+            };
+            attach_main_once(session, url, &fresh).await
+        }
+        other => other,
+    }
+}
+
+async fn attach_main_once(
     mut session: Signal<crate::live_room_session::LiveRoomSession>,
     url: &str,
     viewer_jwt: &str,
@@ -1114,6 +1200,22 @@ async fn attach_main_unguarded(
 /// Screen-share equivalent of [`attach_main_unguarded`]. Uses `view_once`: a
 /// 404 here means "the teacher is not sharing", which is the normal case.
 async fn attach_screen_unguarded(
+    session: Signal<crate::live_room_session::LiveRoomSession>,
+    url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    match attach_screen_once(session, url, viewer_jwt).await {
+        Err(e) if is_expired_viewer_credential(&e) => {
+            let Some(fresh) = refresh_viewer_jwt(session, viewer_jwt).await else {
+                return Err(e);
+            };
+            attach_screen_once(session, url, &fresh).await
+        }
+        other => other,
+    }
+}
+
+async fn attach_screen_once(
     mut session: Signal<crate::live_room_session::LiveRoomSession>,
     url: &str,
     viewer_jwt: &str,
@@ -1135,6 +1237,23 @@ async fn attach_screen_unguarded(
 
 /// Promoted-student equivalent of [`attach_main_unguarded`].
 async fn attach_student_unguarded(
+    session: Signal<crate::live_room_session::LiveRoomSession>,
+    user_id: uuid::Uuid,
+    whep_url: &str,
+    viewer_jwt: &str,
+) -> Result<(), String> {
+    match attach_student_once(session, user_id, whep_url, viewer_jwt).await {
+        Err(e) if is_expired_viewer_credential(&e) => {
+            let Some(fresh) = refresh_viewer_jwt(session, viewer_jwt).await else {
+                return Err(e);
+            };
+            attach_student_once(session, user_id, whep_url, &fresh).await
+        }
+        other => other,
+    }
+}
+
+async fn attach_student_once(
     mut session: Signal<crate::live_room_session::LiveRoomSession>,
     user_id: uuid::Uuid,
     whep_url: &str,
@@ -1151,7 +1270,10 @@ async fn attach_student_unguarded(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        session.write().attach_student(user_id, whep_url, viewer_jwt).await
+        session
+            .write()
+            .attach_student(user_id, whep_url, viewer_jwt)
+            .await
     }
 }
 
@@ -1459,13 +1581,16 @@ fn render_webrtc(
                 if main_url.is_empty() {
                     return;
                 }
-                let result = if let Some(mut session) = session {
-                    let main = session.write().attach_main(&main_url, &viewer_jwt).await;
+                let result = if let Some(session) = session {
+                    // Through the `*_unguarded` wrappers, not the session
+                    // methods directly: the wrappers re-mint the viewer JWT and
+                    // retry when the credential is what was refused, which is
+                    // what keeps a class that outlives the token watchable on
+                    // desktop / mobile as well as in the browser.
+                    let main = attach_main_unguarded(session, &main_url, &viewer_jwt).await;
                     if main.is_ok() && !screen_url.is_empty() {
-                        if let Err(error) = session
-                            .write()
-                            .attach_screen(&screen_url, &viewer_jwt)
-                            .await
+                        if let Err(error) =
+                            attach_screen_unguarded(session, &screen_url, &viewer_jwt).await
                         {
                             tracing::debug!(%error, "native screen WHEP feed is not active");
                         }
@@ -1768,5 +1893,32 @@ mod tests {
         vdom.rebuild_in_place();
         let html = dioxus_ssr::render(&vdom);
         assert!(html.contains("Group 1"), "room name missing: {html}");
+    }
+
+    #[test]
+    fn only_a_refused_credential_triggers_a_viewer_jwt_refresh() {
+        // The viewer JWT has a fixed TTL while a class has no maximum
+        // duration, so a long class WILL outlive it and a re-attach must
+        // recover by re-minting rather than leaving the student's video dead.
+        assert!(is_expired_viewer_credential("WHEP returned 401"));
+        assert!(is_expired_viewer_credential("WHEP returned 403"));
+
+        // ...but only for auth. A refresh cannot fix any of these, and
+        // retrying `/join` on them would hammer the API while the real
+        // problem (path not ready, no network route) persists.
+        for benign in [
+            "WHEP returned 404",
+            "WHEP returned 500",
+            "WHEP subscribe did not connect: ICE failed: no usable network path \
+             to the media server. A TURN relay is required when publisher and \
+             server are on different networks.",
+            "fetch: JsValue(TypeError)",
+            "peer connection closed before it connected",
+        ] {
+            assert!(
+                !is_expired_viewer_credential(benign),
+                "{benign} must not be treated as an expired credential"
+            );
+        }
     }
 }

@@ -112,6 +112,19 @@ pub struct ActiveSessionInfo {
     pub title: String,
     pub starts_at: chrono::DateTime<chrono::Utc>,
     pub transport_mode: String,
+    /// Whether the teacher's stream is ACTUALLY flowing on the media server
+    /// right now, as reported by MediaMTX for this session's main path.
+    ///
+    /// The presence of the session itself says nothing about this: `status`
+    /// becomes `live` the instant the teacher presses Start, which is before
+    /// any WHIP attempt is made and stays set when that attempt fails. The
+    /// student-facing "Live now" badge is gated on this field, so a failed or
+    /// still-connecting publish never advertises a class as live.
+    ///
+    /// False whenever readiness cannot be positively confirmed -- path
+    /// inactive, no path recorded yet, or the media server unreachable -- so
+    /// the badge fails closed.
+    pub stream_ready: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -768,20 +781,40 @@ async fn active_session_inner(
         return Err(ApiError::NotFound);
     }
 
-    let active = db::live_sessions::find_live_for_course_with_context(
+    let row = db::live_sessions::find_live_for_course_with_context(
         pool,
         ctx.user_id,
         ctx.tenant_id,
         course_id,
     )
     .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?
-    .map(|row| ActiveSessionInfo {
-        session_id: row.id,
-        title: row.title,
-        starts_at: row.actual_started_at.unwrap_or(row.starts_at),
-        transport_mode: row.transport_mode,
-    });
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let active = match row {
+        None => None,
+        Some(row) => {
+            // Ask the media server whether anything is actually being
+            // published, instead of trusting the row. Bounded by the same
+            // short probe timeout the health endpoint uses, so a slow or dead
+            // MediaMTX cannot hold this poll open.
+            let stream_ready = match row.main_path.as_deref() {
+                Some(path) => matches!(
+                    path_status_with_timeout(state.mediamtx(), path).await,
+                    Some(Ok(crate::services::mediamtx::PathStatus::Active))
+                ),
+                // Live row with no path recorded yet: the teacher has not got
+                // as far as go-live, so nothing can be flowing.
+                None => false,
+            };
+            Some(ActiveSessionInfo {
+                session_id: row.id,
+                title: row.title,
+                starts_at: row.actual_started_at.unwrap_or(row.starts_at),
+                transport_mode: row.transport_mode,
+                stream_ready,
+            })
+        }
+    };
 
     Ok(Json(ActiveSessionResponse { active }))
 }
@@ -1095,13 +1128,24 @@ async fn go_live_inner(
         )));
     }
 
+    // The go-live window governs STARTING a class, not continuing one.
+    //
+    // A session that is already `live` reaches here when the teacher
+    // re-publishes: switching camera, recovering from a dropped connection, or
+    // reloading the room all re-run go-live to mint a fresh publish
+    // credential. Applying the window to those turned GO_LIVE_WINDOW_AFTER
+    // into a hard 4h cap on class length -- past it, a teacher who lost their
+    // connection could not get back on air. There is no maximum class
+    // duration, so an already-started class is exempt.
     let now = chrono::Utc::now();
-    let earliest = session.starts_at - GO_LIVE_WINDOW_BEFORE;
-    let latest = session.starts_at + GO_LIVE_WINDOW_AFTER;
-    if now < earliest || now > latest {
-        return Err(ApiError::SessionWindowClosed(format!(
-            "go-live allowed between {earliest} and {latest}; now is {now}"
-        )));
+    if session.status != "live" {
+        let earliest = session.starts_at - GO_LIVE_WINDOW_BEFORE;
+        let latest = session.starts_at + GO_LIVE_WINDOW_AFTER;
+        if now < earliest || now > latest {
+            return Err(ApiError::SessionWindowClosed(format!(
+                "go-live allowed between {earliest} and {latest}; now is {now}"
+            )));
+        }
     }
 
     let main_path =
@@ -1430,29 +1474,28 @@ fn join_window_open(
         return true;
     }
     let open_from = starts_at - chrono::Duration::minutes(JOIN_WINDOW_BEFORE);
-    // Same floor the auto-end sweep applies. Without it the join window closed
-    // at the BOOKED duration (60 minutes for a start-now class), so a student
-    // who dropped at minute 70 of a class that was still running could not get
-    // back in, and a late joiner was refused outright -- while the teacher was
-    // still publishing. The booked duration is a scheduling hint; the class is
-    // over when the teacher ends it or the sweep reclaims it.
-    let effective_minutes =
-        duration_minutes.max(crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES);
-    let open_until = match actual_ended_at {
+    // `duration_minutes` is a scheduling hint and is deliberately NOT a bound
+    // on entry.
+    //
+    // It used to be: `open_until` was the booked duration (60 minutes for a
+    // start-now class), so a student who dropped out at minute 70 of a class
+    // that was still running could not get back in, and a late joiner was
+    // refused outright -- while the teacher was still publishing. Raising it to
+    // a longer floor only moved the same wall further out.
+    //
+    // A running class has no expiry: it is over when the teacher ends it (which
+    // stamps `actual_ended_at`, taken below) or when the sweep observes that
+    // the publisher is genuinely gone and flips the status. Both are real
+    // events, so the clock has no say here.
+    let _ = duration_minutes;
+    match actual_ended_at {
         // Class is over: the ordinary short rejoin grace applies.
-        Some(ended) => ended + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END),
-        // Still running: stay joinable for exactly as long as the auto-end
-        // sweep is willing to leave it live. Using the shorter grace here left
-        // a window where the room was `live` and still publishing but refused
-        // joins with 400 -- measured at 209 minutes on a start-now class.
-        None => {
-            starts_at
-                + chrono::Duration::minutes(
-                    effective_minutes + crate::db::live_sessions::AUTO_END_GRACE_MINUTES,
-                )
+        Some(ended) => {
+            now >= open_from && now <= ended + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END)
         }
-    };
-    now >= open_from && now <= open_until
+        // Still running: open from the lobby onwards, with no upper bound.
+        None => now >= open_from,
+    }
 }
 const LIVE_HEALTH_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
@@ -5128,22 +5171,29 @@ mod health_tests {
         assert_eq!(screen.detail, "Could not check screen share path");
     }
 
-    /// Mirrors the `sweep_auto_end` predicate in SQL:
-    ///   actual_started_at + (GREATEST(duration_minutes, $1) + $2) min < now()
-    fn sweep_would_end(duration_minutes: i64, minutes_running: i64) -> bool {
-        let effective = duration_minutes.max(crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES)
-            + crate::db::live_sessions::AUTO_END_GRACE_MINUTES;
-        minutes_running > effective
+    /// Mirrors the `end_if_publisher_gone` predicate in SQL:
+    ///   publisher_last_seen_at + PUBLISHER_GONE_GRACE_MINUTES < now()
+    ///
+    /// Note what is absent: `actual_started_at`, `duration_minutes` and any
+    /// notion of elapsed class time. The sweep cannot see how long a class has
+    /// been running, which is what makes an unlimited duration structural
+    /// rather than a large number.
+    fn sweep_would_end(minutes_publisher_absent: i64) -> bool {
+        minutes_publisher_absent > crate::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES
     }
 
     #[test]
-    fn a_live_class_survives_at_least_180_minutes() {
-        // The reported failure: start-now books 60 minutes, so the sweep ended
-        // a running class at 60 + 30 = 90 while the teacher was still teaching.
-        for running in [60, 120, 179, 180] {
+    fn a_healthy_class_is_never_ended_no_matter_how_long_it_runs() {
+        // The original failure: `start-now` books 60 minutes, so the wall-clock
+        // sweep ended a running class at 60 + 30 = 90 while the teacher was
+        // still teaching. Raising that deadline to 180 only moved the wall to
+        // 210. Both are gone: while the publisher is present the absence clock
+        // is reset on every tick, so the sweep has nothing to act on.
+        for running in [60, 90, 210, 8 * 60, 24 * 60, 7 * 24 * 60] {
+            // A publisher seen on this tick has been absent for 0 minutes.
             assert!(
-                !sweep_would_end(60, running),
-                "a start-now class must still be live at {running} minutes"
+                !sweep_would_end(0),
+                "a publishing class must survive {running} minutes"
             );
             assert!(
                 join_window_open(
@@ -5151,7 +5201,7 @@ mod health_tests {
                     chrono::Utc::now(),
                     chrono::Utc::now() - chrono::Duration::minutes(running),
                     60,
-                    None
+                    None,
                 ),
                 "a student must still be able to join at {running} minutes"
             );
@@ -5159,54 +5209,71 @@ mod health_tests {
     }
 
     #[test]
-    fn a_running_class_stays_joinable_until_the_sweep_would_end_it() {
+    fn a_running_class_has_no_upper_join_bound() {
         // Regression: measured at 209 minutes the room was still `live` and
-        // publishing, but join returned 400 because the join window used the
-        // shorter rejoin grace. The two deadlines must match.
+        // publishing, but /join returned 400 because the join window carried
+        // its own deadline. A running class now has no upper bound at all, so
+        // the two can no longer disagree.
         let starts = chrono::Utc::now();
-        let deadline = crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES
-            + crate::db::live_sessions::AUTO_END_GRACE_MINUTES; // 210
-        for running in [180, 195, 209, deadline] {
+        for running in [30, 210, 12 * 60, 30 * 24 * 60] {
             assert!(
                 join_window_open(
                     "live",
                     starts + chrono::Duration::minutes(running),
                     starts,
                     60,
-                    None
+                    None,
                 ),
                 "a live class must stay joinable at {running} minutes"
             );
         }
+    }
+
+    #[test]
+    fn the_booked_duration_never_bounds_a_running_class() {
+        // `duration_minutes` is a scheduling hint. It must not shorten entry,
+        // whatever it is set to -- including the 60 that `start-now` books.
+        let starts = chrono::Utc::now();
+        for booked in [1, 15, 60, 300] {
+            assert!(
+                join_window_open(
+                    "live",
+                    starts + chrono::Duration::minutes(booked * 10 + 600),
+                    starts,
+                    booked,
+                    None,
+                ),
+                "a class booked for {booked} minutes must not be cut off"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abandoned_room_is_still_reclaimed_once_the_publisher_is_gone() {
+        // Removing the duration cap must not mean rooms leak forever. The
+        // bound is now real disconnection, not elapsed time.
+        let grace = crate::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES;
         assert!(
-            !join_window_open(
-                "live",
-                starts + chrono::Duration::minutes(deadline + 1),
-                starts,
-                60,
-                None
-            ),
-            "past the sweep deadline the window must close"
+            !sweep_would_end(grace),
+            "must survive to the end of the confirmation window"
+        );
+        assert!(
+            sweep_would_end(grace + 1),
+            "an abandoned room must be reclaimed once the publisher is confirmed gone"
         );
     }
 
     #[test]
-    fn expiry_happens_only_after_the_floor_plus_grace() {
-        // Still bounded: the floor moves the deadline, it does not remove it.
-        let deadline = crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES
-            + crate::db::live_sessions::AUTO_END_GRACE_MINUTES; // 210
-        assert!(!sweep_would_end(60, deadline), "must survive to the deadline");
-        assert!(
-            sweep_would_end(60, deadline + 1),
-            "an abandoned room must still be reclaimed past the deadline"
-        );
-    }
-
-    #[test]
-    fn a_longer_booked_class_keeps_its_own_longer_window() {
-        // The floor must not SHORTEN anything: a 300-minute booking keeps 330.
-        assert!(!sweep_would_end(300, 320));
-        assert!(sweep_would_end(300, 331));
+    fn a_brief_publisher_blip_does_not_end_the_class() {
+        // A dropped Wi-Fi packet, a laptop sleeping briefly, or a re-publish
+        // when the teacher switches camera must all survive. Anything shorter
+        // than the confirmation window is not a disconnection.
+        for blip in [0, 1, 5, crate::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES - 1] {
+            assert!(
+                !sweep_would_end(blip),
+                "a {blip}-minute interruption must not end the class"
+            );
+        }
     }
 
     #[test]
@@ -5229,22 +5296,32 @@ mod health_tests {
     }
 
     #[test]
-    fn viewer_jwt_outlives_the_maximum_live_session() {
-        // A student who joins at minute 0 must not have their token expire
-        // while the class is still legally running.
-        let max_session_secs =
-            (crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES
-                + crate::db::live_sessions::AUTO_END_GRACE_MINUTES) as u64
-                * 60;
+    fn media_credentials_are_reissued_rather_than_sized_to_a_max_session() {
+        // This test used to assert `VIEWER_JWT_TTL >= the maximum live
+        // session`. There is no maximum live session any more, so that
+        // comparison has no right-hand side -- and the invariant it encoded is
+        // not merely unavailable, it is unachievable: NO fixed token lifetime
+        // can cover an unbounded class.
+        //
+        // What must hold instead is that these are credentials for an
+        // OPERATION, not a lease on the class:
+        //
+        //   * the publish nonce is re-minted by `/go-live`, which an
+        //     already-`live` session may call at any age (see `go_live_inner`),
+        //     so a teacher who reconnects at hour nine gets a fresh one;
+        //   * the viewer JWT is re-minted by `/join`, which a running class
+        //     answers with no upper bound (see `join_window_open`).
+        //
+        // Both are therefore bounded by the time between reconnects, not by
+        // class length, and are kept comfortably longer than any single
+        // connection so a healthy stream is never churned to refresh them.
         assert!(
-            VIEWER_JWT_TTL.as_secs() >= max_session_secs,
-            "viewer JWT ({}s) must cover the longest live session ({}s)",
-            VIEWER_JWT_TTL.as_secs(),
-            max_session_secs
+            VIEWER_JWT_TTL.as_secs() >= 60 * 60,
+            "viewer JWT must comfortably outlast a single connection"
         );
         assert!(
-            PUBLISH_NONCE_TTL.as_secs() >= max_session_secs,
-            "publish nonce must cover the longest live session"
+            PUBLISH_NONCE_TTL.as_secs() >= 60 * 60,
+            "publish nonce must comfortably outlast a single connection"
         );
     }
 
@@ -5304,26 +5381,27 @@ mod health_tests {
             60,
             None
         ));
-        // Live row left stale long after the class could possibly run: entry
-        // must still be refused. The bound is now the MIN_LIVE_SESSION_MINUTES
-        // floor rather than the booked 60, because a booked duration no longer
-        // cuts a running class short -- but it is still a bound.
-        let past_floor = starts
-            + chrono::Duration::minutes(
-                crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES
-                    + crate::db::live_sessions::AUTO_END_GRACE_MINUTES
-                    + 1,
+        // A `live` row is joinable for as long as it says `live`, however old
+        // it is. This is the deliberate consequence of removing the duration
+        // cap: entry is gated by SESSION STATE, never by a clock, so there is
+        // no age at which a still-running class starts refusing students.
+        //
+        // What bounds a stale row is therefore the sweep, not this function.
+        // A room whose publisher vanished flips to `ended` within
+        // PUBLISHER_GONE_GRACE_MINUTES plus one sweep tick, and the `ended`
+        // branch above then applies. That is why the sweep tick must stay
+        // short relative to the absence window -- it is the only thing
+        // closing this door now.
+        for age in [
+            crate::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES + 1,
+            210,
+            24 * 60,
+        ] {
+            assert!(
+                join_window_open("live", starts + chrono::Duration::minutes(age), starts, 60, None),
+                "a row still marked live must stay joinable at {age} minutes"
             );
-        assert!(!join_window_open("live", past_floor, starts, 60, None));
-        // ...and just inside the floor it is still open.
-        assert!(join_window_open(
-            "live",
-            starts
-                + chrono::Duration::minutes(crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES - 1),
-            starts,
-            60,
-            None
-        ));
+        }
         // A cancelled class never happened and has nothing to replay.
         assert!(!join_window_open(
             "cancelled",
@@ -5338,9 +5416,7 @@ mod health_tests {
     fn join_window_uses_actual_end_when_a_class_runs_over() {
         // A class that ran past its scheduled duration must stay joinable for
         // the grace period after it ACTUALLY ended, not after it was booked to.
-        // Booked well beyond MIN_LIVE_SESSION_MINUTES so the floor is not what
-        // is being measured here: this test is about actual_ended_at winning.
-        let booked = crate::db::live_sessions::MIN_LIVE_SESSION_MINUTES + 120; // 300
+        let booked = 300;
         let starts = chrono::Utc::now() - chrono::Duration::minutes(booked + 60);
         let actual_end = starts + chrono::Duration::minutes(booked - 10);
         let just_after = actual_end + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END - 1);
@@ -5351,13 +5427,18 @@ mod health_tests {
             booked,
             Some(actual_end)
         ));
-        // Without the actual end the window runs to booked + grace, and this
-        // instant sits past it.
-        let well_past = starts
-            + chrono::Duration::minutes(
-                booked + crate::db::live_sessions::AUTO_END_GRACE_MINUTES + 1,
-            );
-        assert!(!join_window_open("live", well_past, starts, booked, None));
+        // ...and the grace does expire, keyed off the REAL end instant.
+        let well_past = actual_end + chrono::Duration::minutes(JOIN_WINDOW_AFTER_END + 1);
+        assert!(!join_window_open(
+            "live",
+            well_past,
+            starts,
+            booked,
+            Some(actual_end)
+        ));
+        // Ending the class is what closes entry. Running long does not: the
+        // same instant, with no actual end recorded, is still open.
+        assert!(join_window_open("live", well_past, starts, booked, None));
     }
 
     #[test]

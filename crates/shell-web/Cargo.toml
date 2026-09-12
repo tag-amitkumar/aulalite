@@ -29,7 +29,11 @@ tracing = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.3", features = ["futures"] }
-web-sys = { version = "0.3", features = ["Window", "Storage", "Location", "Navigator", "History"] }
+# "console" is used directly by this crate (the lobby poll logs an unrecognised
+# session state). web-sys gates each type behind a feature of the same name, so
+# declare it here rather than inheriting it from features-courses by workspace
+# feature unification.
+web-sys = { version = "0.3", features = ["Window", "console", "Storage", "Location", "Navigator", "History"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["time"] }

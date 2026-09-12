@@ -44,13 +44,30 @@ const LOBBY_POLL_MS: u32 = 5_000;
 /// Backoff after a transient failure, so a flaking backend is not hammered.
 const LOBBY_POLL_BACKOFF_MS: u32 = 15_000;
 
-/// Upper bound on how long a lobby keeps asking.
+/// How long to idle between visibility checks while the tab is in the
+/// background.
 ///
-/// Without one, a tab left open on a class that never starts -- or on a session
-/// whose state string this build does not recognise, which `map_status` maps to
-/// `Scheduled` -- polls for as long as the tab lives. Two hours comfortably
-/// outlasts "the teacher is running late" while still terminating.
-const LOBBY_POLL_MAX_MS: u32 = 2 * 60 * 60 * 1_000;
+/// A hidden tab issues NO requests. This is what replaced the old two-hour
+/// `LOBBY_POLL_MAX_MS` deadline: the cap existed because a tab left open on a
+/// class that never starts polled for as long as it lived, but a deadline
+/// answered that by also cutting off students waiting on a teacher who was
+/// merely running very late. Gating on whether anyone is actually looking
+/// removes the waste without inventing a moment at which a waiting student
+/// stops being told the truth.
+#[cfg(target_arch = "wasm32")]
+const LOBBY_POLL_HIDDEN_MS: u32 = 5_000;
+
+/// Is this a session state this build actually understands?
+///
+/// `map_status` renders an unrecognised state as `Scheduled`, which is the
+/// right RENDERING choice -- degrade to the lobby rather than a blank screen --
+/// and the wrong POLLING choice. A state this build cannot interpret will never
+/// be observed to "start", so a lobby keyed on it asks forever. That, not the
+/// honest "teacher is late" case, is what the old two-hour cap was really
+/// containing. Terminating on it directly lets the cap go.
+fn is_known_state(s: &str) -> bool {
+    matches!(s, "scheduled" | "live" | "ended" | "cancelled")
+}
 
 fn map_status(s: &str) -> SessionStatus {
     match s {
@@ -108,8 +125,17 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
         let session_id = session_id_for_poll.clone();
         let poll_role = poll_role.clone();
         async move {
-            let mut waited_ms: u32 = 0;
             loop {
+                // A backgrounded tab asks nothing. Nobody is reading the lobby,
+                // so a request now buys no one anything; when the tab comes
+                // back we resume within one short idle. This is the whole
+                // reason the poll no longer needs a deadline to be cheap.
+                #[cfg(target_arch = "wasm32")]
+                if features_courses::browser_runtime::page_is_hidden() {
+                    gloo_timers::future::TimeoutFuture::new(LOBBY_POLL_HIDDEN_MS).await;
+                    continue;
+                }
+
                 let api = api_signal.read().clone();
                 let attempt = fetch_json::<JoinResp>(
                     &api,
@@ -121,19 +147,33 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
 
                 let delay_ms = match attempt {
                     Ok(j) => {
-                        let keep_waiting =
-                            features_courses::should_poll_for_start(&poll_role, &map_status(&j.state));
-                        join_state.set(Some(Ok(j)));
-                        if !keep_waiting {
-                            return;
-                        }
-                        if waited_ms >= LOBBY_POLL_MAX_MS {
-                            #[cfg(target_arch = "wasm32")]
-                            web_sys::console::log_1(
-                                &"[live_session] lobby poll gave up: class never started".into(),
+                        let keep_waiting = features_courses::should_poll_for_start(
+                            &poll_role,
+                            &map_status(&j.state),
+                        );
+                        // A state this build cannot interpret is rendered as
+                        // the lobby but will never be seen to start, so asking
+                        // again is pointless rather than merely slow.
+                        let understood = is_known_state(&j.state);
+                        #[cfg(target_arch = "wasm32")]
+                        if !understood {
+                            web_sys::console::warn_1(
+                                &format!(
+                                    "[live_session] unrecognised session state {:?}; \
+                                     stopping lobby poll",
+                                    j.state
+                                )
+                                .into(),
                             );
+                        }
+                        join_state.set(Some(Ok(j)));
+                        if !keep_waiting || !understood {
                             return;
                         }
+                        // No elapsed-time bound. A class has no maximum
+                        // duration and a teacher has no deadline to start by;
+                        // the student waits until the class actually starts,
+                        // is cancelled, or they close the tab.
                         LOBBY_POLL_MS
                     }
                     // An expired/rejected token will never recover by retrying,
@@ -159,7 +199,6 @@ pub fn LiveSession(slug: String, session_id: String) -> Element {
                     }
                 };
 
-                waited_ms = waited_ms.saturating_add(delay_ms);
                 #[cfg(target_arch = "wasm32")]
                 gloo_timers::future::TimeoutFuture::new(delay_ms).await;
                 #[cfg(not(target_arch = "wasm32"))]
@@ -289,6 +328,56 @@ fn LiveSessionShell(
             screen_url: screen_url.clone(),
             has_recording: has_recording,
             is_teacher: is_teacher,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `CallerRole` and `SessionStatus` arrive via the glob from the parent.
+    use super::*;
+    use features_courses::should_poll_for_start;
+
+    #[test]
+    fn a_lobby_keeps_waiting_however_late_the_teacher_is() {
+        // Regression: the poll used to stop after a fixed two hours, so a
+        // student waiting on a class that started late sat on "Waiting for the
+        // instructor..." forever even once it went live. Nothing about the
+        // decision to keep waiting may depend on elapsed time -- it is a pure
+        // function of the session's state.
+        assert!(should_poll_for_start(
+            &CallerRole::Student,
+            &map_status("scheduled")
+        ));
+    }
+
+    #[test]
+    fn a_lobby_stops_once_the_session_reaches_a_real_outcome() {
+        // The poll is bounded by events, not by a clock.
+        for terminal in ["live", "ended", "cancelled"] {
+            assert!(
+                !should_poll_for_start(&CallerRole::Student, &map_status(terminal)),
+                "{terminal} must stop the lobby poll"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_state_is_rendered_as_the_lobby_but_never_polled_forever() {
+        // `map_status` degrades an unknown state to the lobby so the UI is not
+        // blank -- which on its own would poll forever, since such a state can
+        // never be observed to start. That combination, not the honest "late
+        // teacher" case, is what the old cap was containing, so the poll
+        // terminates on it explicitly instead.
+        assert_eq!(map_status("something_new"), SessionStatus::Scheduled);
+        assert!(should_poll_for_start(
+            &CallerRole::Student,
+            &map_status("something_new")
+        ));
+        assert!(!is_known_state("something_new"));
+
+        for known in ["scheduled", "live", "ended", "cancelled"] {
+            assert!(is_known_state(known), "{known} must be understood");
         }
     }
 }

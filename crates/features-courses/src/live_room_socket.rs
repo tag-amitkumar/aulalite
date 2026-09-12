@@ -241,19 +241,41 @@ pub fn parse_event(text: &str) -> Result<ServerEvent, String> {
 
 /// Returns the next backoff delay (in ms) given the attempt count.
 /// Sequence: 1000, 2000, 4000, 8000, 30000, 30000, ...
+///
+/// Defined for EVERY attempt count: the plateau at [`RECONNECT_MAX_DELAY_MS`]
+/// is what makes an uncapped retry loop safe, so there is no attempt number at
+/// which the caller is expected to stop asking.
 pub fn backoff_delay_ms(attempt: u32) -> u64 {
     match attempt {
         0 => 1000,
         1 => 2000,
         2 => 4000,
         3 => 8000,
-        _ => 30000,
+        _ => RECONNECT_MAX_DELAY_MS,
     }
 }
 
-/// Maximum number of reconnect attempts before giving up and surfacing
-/// the disconnect to the UI. Matches the design doc cap.
-pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// The live-room socket retries for as long as the room is open.
+///
+/// There used to be a cap of 5 attempts here. With [`backoff_delay_ms`] that
+/// is 1+2+4+8+30 = 45 SECONDS of total tolerance, after which the socket gave
+/// up permanently and the only recovery was a page reload. A laptop lid closed
+/// for a minute, a Wi-Fi handover, or a phone losing signal in a lift all
+/// exceed that comfortably.
+///
+/// A cap on retries is a cap on how long a class can survive a network
+/// interruption, and a class has no maximum duration, so the retry loop must
+/// not have one either. The delay is still bounded -- it plateaus at 30s, so a
+/// client polls a dead server at most twice a minute -- and the loop still
+/// exits promptly on the things that genuinely mean "stop":
+///
+///   * the room is closed / unmounted (`closed` flag, or the socket dropped),
+///   * `4003 AUTH_INVALID`, which is a real authorization failure rather than
+///     a transport problem.
+///
+/// `4001 AUTH_EXPIRED` is NOT terminal: the token is refreshed and the loop
+/// reconnects, which is what lets a session outlive any single token.
+pub const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
 /// Keep presence fresh across mobile radio changes and intermediary timeouts.
 /// This is intentionally slower than media stats polling and safely below the
@@ -268,9 +290,10 @@ pub const PRESENCE_HEARTBEAT_PAYLOAD: &str = r#"{"type":"heartbeat"}"#;
 /// * `Connected` — socket is open; the room is fully live.
 /// * `Reconnecting` — the socket dropped and an exponential-backoff
 ///   reconnect is scheduled (see [`backoff_delay_ms`]).
-/// * `Disconnected` — terminal: either the close was `Surface`
-///   (4003 auth-invalid) or [`MAX_RECONNECT_ATTEMPTS`] was exhausted. The
-///   user must reload to rejoin.
+/// * `Disconnected` — terminal: the close was `Surface` (4003 auth-invalid),
+///   which is a real authorization failure. A transport drop never lands here
+///   however long it lasts; it stays `Reconnecting` until it recovers or the
+///   room is closed, so an outage cannot strand a class that is still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnStatus {
     #[default]
@@ -285,7 +308,8 @@ pub enum ConnStatus {
 /// * `4001` (`AUTH_EXPIRED`) — refresh the JWT then reconnect.
 /// * `4003` (`AUTH_INVALID`) — surface to the UI; do not reconnect.
 /// * other codes (incl. `1006` abnormal-close) — exponential-backoff
-///   reconnect (capped by [`MAX_RECONNECT_ATTEMPTS`] and [`backoff_delay_ms`]).
+///   reconnect, retried for as long as the room is open (delay capped by
+///   [`backoff_delay_ms`] at [`RECONNECT_MAX_DELAY_MS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
     /// Reconnect after acquiring a fresh access token.
@@ -369,6 +393,28 @@ mod tests {
         assert_eq!(backoff_delay_ms(3), 8000);
         assert_eq!(backoff_delay_ms(4), 30000);
         assert_eq!(backoff_delay_ms(99), 30000);
+    }
+
+    #[test]
+    fn reconnects_are_bounded_in_delay_but_not_in_count() {
+        // Regression guard. There used to be MAX_RECONNECT_ATTEMPTS = 5, which
+        // with this sequence is 1+2+4+8+30 = 45 SECONDS of total tolerance;
+        // past that the room was stranded until the user reloaded. A laptop
+        // lid closed for a minute exceeds it. A retry cap is a cap on how long
+        // a class can survive an interruption, and classes have no maximum
+        // duration -- so the count must stay unbounded while the DELAY stays
+        // bounded, which is what keeps a dead server from being hammered.
+        assert_eq!(
+            backoff_delay_ms(u32::MAX),
+            RECONNECT_MAX_DELAY_MS,
+            "delay must plateau rather than grow without bound"
+        );
+        for attempt in [5u32, 50, 5_000, u32::MAX] {
+            assert!(
+                backoff_delay_ms(attempt) <= RECONNECT_MAX_DELAY_MS,
+                "attempt {attempt} must still be scheduled, at the capped delay"
+            );
+        }
     }
 
     #[test]
@@ -844,11 +890,12 @@ pub mod conn {
                                 on_status(ConnStatus::Disconnected);
                                 break;
                             }
+                            // Transport-level close. Retry indefinitely: the
+                            // room is still open, so giving up here would
+                            // strand a class that is still running. The delay
+                            // plateaus at RECONNECT_MAX_DELAY_MS, so this is
+                            // at most two attempts a minute.
                             Ok((action, _)) => {
-                                if attempt >= MAX_RECONNECT_ATTEMPTS {
-                                    on_status(ConnStatus::Disconnected);
-                                    break;
-                                }
                                 on_status(ConnStatus::Reconnecting);
                                 if matches!(action, CloseAction::RefreshToken) {
                                     next_token = refresh().await;
@@ -857,21 +904,20 @@ pub mod conn {
                                     backoff_delay_ms(attempt) as u32
                                 )
                                 .await;
-                                attempt += 1;
+                                attempt = attempt.saturating_add(1);
                                 // loop → reconnect
                             }
                         }
                     }
                     Err(_) => {
-                        // Could not open the socket at all. Retry with backoff.
-                        if attempt >= MAX_RECONNECT_ATTEMPTS {
-                            on_status(ConnStatus::Disconnected);
-                            break;
-                        }
+                        // Could not open the socket at all -- typically the
+                        // network is down. Same contract as above: keep
+                        // retrying at the capped backoff until it comes back
+                        // or the room closes.
                         on_status(ConnStatus::Reconnecting);
                         gloo_timers::future::TimeoutFuture::new(backoff_delay_ms(attempt) as u32)
                             .await;
-                        attempt += 1;
+                        attempt = attempt.saturating_add(1);
                     }
                 }
             }
@@ -893,7 +939,7 @@ pub mod conn {
     const NATIVE_SOCKET_SCRIPT: &str = r#"
 const config = await dioxus.recv();
 const MAX_MESSAGE_BYTES = 65536;
-const MAX_RECONNECTS = 8;
+const RECONNECT_MAX_DELAY_CAP_MS = 30000;
 let ws = null;
 let closed = false;
 let reconnects = 0;
@@ -951,11 +997,11 @@ const connect = () => {
       emit({ kind: "status", status: "disconnected" });
       return;
     }
-    if (reconnects >= MAX_RECONNECTS) {
-      emit({ kind: "status", status: "disconnected" });
-      return;
-    }
-    const delay = Math.min(30000, 1000 * (2 ** reconnects++));
+    // No attempt cap: a capped retry count is a cap on how long a class can
+    // survive a network interruption, and a class has no maximum duration.
+    // The DELAY is capped instead (RECONNECT_MAX_DELAY_CAP_MS), so a dead
+    // server is polled at most twice a minute. Terminal cases returned above.
+    const delay = Math.min(RECONNECT_MAX_DELAY_CAP_MS, 1000 * (2 ** Math.min(reconnects++, 10)));
     emit({ kind: "status", status: "reconnecting" });
     reconnectTimer = setTimeout(connect, delay);
   };
@@ -1201,7 +1247,7 @@ return true;
         fn native_socket_bridge_bounds_messages_and_recovers_connections() {
             for contract in [
                 "MAX_MESSAGE_BYTES",
-                "MAX_RECONNECTS",
+                "RECONNECT_MAX_DELAY_CAP_MS",
                 "heartbeat",
                 "event.code === 4001",
                 "event.code === 4003",

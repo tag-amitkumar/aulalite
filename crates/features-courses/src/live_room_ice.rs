@@ -31,9 +31,20 @@
 //!      `await_connected` turns that silent half-failure into a real error the
 //!      existing retry/error UI can act on.
 //!
-//! Timeouts are sized against the MediaMTX defaults this deployment runs with
-//! (`webrtcHandshakeTimeout: 10s`, `webrtcSTUNGatherTimeout: 5s`), read from
-//! `/v3/config/global/get` rather than guessed.
+//! `await_connected` does this **without an application timeout**: it waits
+//! on the peer connection's own state. A negotiation still in progress is not
+//! a failure, and the 15s budget that used to bound it reported
+//! `timed out after 15000ms waiting for the media connection` for the most
+//! common real failure there is -- a relay allocation that lands late -- then
+//! tore down the publisher. The browser's ICE agent and MediaMTX's own
+//! `webrtcHandshakeTimeout` (10s) are the safeguards that still produce a
+//! terminal `failed`, so nothing hangs.
+//!
+//! The one remaining bound here, `ICE_GATHERING_TIMEOUT_MS`, is sized against
+//! the MediaMTX defaults this deployment runs with
+//! (`webrtcSTUNGatherTimeout: 5s`), read from `/v3/config/global/get` rather
+//! than guessed. It never fails a publish -- it only decides when to POST the
+//! offer with the candidates gathered so far.
 
 /// How long to wait for ICE gathering to reach `complete` before POSTing the
 /// offer anyway.
@@ -59,14 +70,6 @@ pub const PATH_READY_TIMEOUT_MS: u32 = 20_000;
 
 /// Delay between those readiness retries.
 pub const PATH_READY_RETRY_MS: u32 = 500;
-
-/// How long to wait, after the SDP exchange, for the peer connection to reach
-/// `connected`.
-///
-/// Deliberately longer than MediaMTX's `webrtcHandshakeTimeout` (10s) so that
-/// when the server gives up first we observe the resulting failure state and
-/// report *that*, instead of racing it and reporting a less specific timeout.
-pub const CONNECT_TIMEOUT_MS: u32 = 15_000;
 
 /// Resolve the `Location` header of a WHIP/WHEP `201 Created` against the URL
 /// the request was sent to.
@@ -100,7 +103,9 @@ mod imp {
     use std::rc::Rc;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
-    use web_sys::{RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState};
+    use web_sys::{
+        RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
+    };
 
     /// A oneshot that either arm — a peer-connection event or a timer — can
     /// complete, whichever happens first. `Rc<RefCell<Option<Sender>>>` is the
@@ -229,68 +234,110 @@ mod imp {
         rx.await.unwrap_or(false)
     }
 
-    /// Wait until `pc` reports `connectionState == "connected"`, or fail with a
-    /// description of what actually happened.
+    /// Wait until the peer connection actually reaches `connected`, or fail
+    /// with the real reason it will never get there.
     ///
-    /// `failed`/`closed` are terminal and reported immediately. `disconnected`
-    /// is NOT: it is a transient state ICE recovers from on its own, so it is
-    /// left to either recover or run into the timeout.
-    pub async fn await_connected(pc: &RtcPeerConnection, timeout_ms: u32) -> Result<(), String> {
-        fn classify(state: RtcPeerConnectionState) -> Option<Result<(), String>> {
-            match state {
-                RtcPeerConnectionState::Connected => Some(Ok(())),
-                RtcPeerConnectionState::Failed => Some(Err(
+    /// **There is deliberately no application timeout here.** A publish that is
+    /// still negotiating is not a failed publish. The previous 15s budget
+    /// converted the single most common real-world failure -- a TURN allocation
+    /// that lands late, or a slow relay handshake -- into
+    /// `timed out after 15000ms waiting for the media connection`, and the
+    /// caller then tore down the peer connection, released the camera and mic,
+    /// DELETEd the WHIP session and parked the room in a terminal error with no
+    /// retry. A clock is the wrong authority for that decision.
+    ///
+    /// Termination is driven by state instead, which is what makes a timer
+    /// unnecessary rather than merely absent:
+    ///
+    /// * `connected` -> success, media can flow.
+    /// * `failed` -> terminal, reported as the actual ICE failure it is.
+    /// * `closed` -> terminal (the caller closed it, or the page went away).
+    /// * `disconnected` -> transient. ICE recovers from it on its own, and when
+    ///   it cannot, the browser's own consent-freshness machinery (RFC 7675)
+    ///   drives it on to `failed`. That is the low-level safeguard this relies
+    ///   on, and it is why waiting indefinitely does not hang: MediaMTX's
+    ///   handshake timeout closes the server side, which produces `failed`
+    ///   here.
+    ///
+    /// Both `connectionState` and `iceConnectionState` are watched. Success is
+    /// taken only from `connectionState` (ICE `connected` can precede DTLS, so
+    /// media is not yet flowing), but failure is taken from either, because a
+    /// failed ICE agent is authoritative even where `connectionState` lags.
+    ///
+    /// Cancellation remains safe and leak-free: both handlers uninstall on
+    /// drop, and the caller's `close()`/`Drop` releases the peer connection and
+    /// the server-side WHIP session.
+    pub async fn await_connected(pc: &RtcPeerConnection) -> Result<(), String> {
+        fn classify(
+            conn: RtcPeerConnectionState,
+            ice: RtcIceConnectionState,
+        ) -> Option<Result<(), String>> {
+            if conn == RtcPeerConnectionState::Connected {
+                return Some(Ok(()));
+            }
+            if conn == RtcPeerConnectionState::Failed || ice == RtcIceConnectionState::Failed {
+                return Some(Err(
                     "ICE failed: no usable network path to the media server. \
                      A TURN relay is required when publisher and server are on \
                      different networks."
                         .to_string(),
-                )),
-                RtcPeerConnectionState::Closed => {
-                    Some(Err("peer connection closed before it connected".to_string()))
-                }
-                _ => None,
+                ));
             }
+            if conn == RtcPeerConnectionState::Closed || ice == RtcIceConnectionState::Closed {
+                return Some(Err(
+                    "peer connection closed before it connected".to_string()
+                ));
+            }
+            None
         }
 
-        if let Some(done) = classify(pc.connection_state()) {
+        let snapshot = |pc: &RtcPeerConnection| classify(pc.connection_state(), pc.ice_connection_state());
+
+        if let Some(done) = snapshot(pc) {
             return done;
         }
 
-        let (slot, rx) = arm::<Option<Result<(), String>>>();
-        arm_timeout(&slot, timeout_ms, None);
+        let (slot, rx) = arm::<Result<(), String>>();
 
-        let cb = {
+        // One closure body, installed on both state surfaces: whichever fires
+        // first and reaches a terminal verdict takes the sender.
+        let make_cb = || {
             let slot = slot.clone();
             let pc = pc.clone();
             Closure::<dyn FnMut()>::new(move || {
-                if let Some(done) = classify(pc.connection_state()) {
-                    fire(&slot, Some(done));
+                if let Some(done) = classify(pc.connection_state(), pc.ice_connection_state()) {
+                    fire(&slot, done);
                 }
             })
         };
-        pc.set_onconnectionstatechange(Some(cb.as_ref().unchecked_ref()));
-        let _installed = InstalledHandler {
+
+        let conn_cb = make_cb();
+        pc.set_onconnectionstatechange(Some(conn_cb.as_ref().unchecked_ref()));
+        let _conn_installed = InstalledHandler {
             pc: pc.clone(),
             clear: |pc| pc.set_onconnectionstatechange(None),
-            _cb: cb,
+            _cb: conn_cb,
         };
 
-        // Same race as above: the state can advance while we are attaching.
-        if let Some(done) = classify(pc.connection_state()) {
-            fire(&slot, Some(done));
+        let ice_cb = make_cb();
+        pc.set_oniceconnectionstatechange(Some(ice_cb.as_ref().unchecked_ref()));
+        let _ice_installed = InstalledHandler {
+            pc: pc.clone(),
+            clear: |pc| pc.set_oniceconnectionstatechange(None),
+            _cb: ice_cb,
+        };
+
+        // The state can advance while we are attaching, and that transition
+        // would otherwise be missed entirely.
+        if let Some(done) = snapshot(pc) {
+            fire(&slot, done);
         }
 
-        let outcome = rx.await.unwrap_or(None);
-
-        outcome.unwrap_or_else(|| {
-            Err(format!(
-                "timed out after {}ms waiting for the media connection \
-                 (last state: {:?}, ICE: {:?})",
-                timeout_ms,
-                pc.connection_state(),
-                pc.ice_connection_state(),
-            ))
-        })
+        // The sender is held by the installed handlers, which outlive this
+        // await; a cancelled receiver simply drops them. `Err` on the channel
+        // therefore means the peer connection went away underneath us.
+        rx.await
+            .unwrap_or_else(|_| Err("peer connection was dropped while connecting".to_string()))
     }
 
     /// Duplicate a `MediaStream` HANDLE -- the same underlying JS object --
@@ -527,12 +574,20 @@ mod tests {
     }
 
     #[test]
-    fn timeouts_are_ordered_against_the_mediamtx_handshake_window() {
-        // MediaMTX's webrtcHandshakeTimeout is 10s in this deployment. We must
-        // outlast it so its failure is observed rather than raced.
-        assert!(CONNECT_TIMEOUT_MS > 10_000);
-        // Gathering happens before the POST, so it must not eat the handshake
-        // window; keep it comfortably shorter than the connect budget.
-        assert!(ICE_GATHERING_TIMEOUT_MS < CONNECT_TIMEOUT_MS);
+    fn there_is_no_publish_connect_timeout_constant() {
+        // Guards the fix for "timed out after 15000ms waiting for the media
+        // connection". `await_connected` is state driven: it succeeds on
+        // `connected`, fails on `failed`/`closed`, and treats `disconnected`
+        // as transient. Re-introducing a connect budget here would restore the
+        // bug, so this file must not regain such a constant.
+        let src = include_str!("live_room_ice.rs");
+        assert!(
+            !src.contains("CONNECT_TIMEOUT"),
+            "a publish/connect timeout constant is back in live_room_ice.rs"
+        );
+        // The gathering bound is NOT a connect timeout and must stay: it only
+        // decides when to POST the offer with the candidates already gathered,
+        // and never fails the publish.
+        assert_eq!(ICE_GATHERING_TIMEOUT_MS, 5_000);
     }
 }

@@ -221,7 +221,12 @@ fn StartNowSlots(props: StartNowSlotsProps) -> Element {
         }
     } else {
         match &poll_snapshot {
-            PollState::Active(info) => {
+            // "Live now" requires a stream the media server confirms is
+            // flowing, not merely a session row with status = live. The row is
+            // written the instant the teacher presses Start and survives a
+            // failed WHIP publish, so gating on it alone advertised classes
+            // that no student could ever watch.
+            PollState::Active(info) if info.stream_ready => {
                 let active_id = info.session_id.clone();
                 let title = info.title.clone();
                 rsx! {

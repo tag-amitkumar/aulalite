@@ -286,58 +286,112 @@ pub async fn end_class(
     .await
 }
 
-/// Floor, in minutes, on how long a STARTED live class may run before the
-/// auto-end sweep is allowed to terminate it.
+/// How long the media server must report NO publisher on a live session's path
+/// before the sweep reclaims that session.
 ///
-/// The sweep keys off the session's booked `duration_minutes`, and `start-now`
-/// books 60 by default, so a class that ran long was force-ended at 90 minutes
-/// (60 + the 30-minute grace) with the teacher still presenting. A booked
-/// duration is a scheduling hint, not a hard stop.
+/// This is a real-disconnection confirmation window, not a limit on how long a
+/// class may run. There is deliberately **no maximum live-class duration**: a
+/// class whose teacher is still publishing is never ended by this sweep, no
+/// matter how long it has been running. The previous behaviour force-ended any
+/// live row at `actual_started_at + duration + grace`, which terminated
+/// healthy classes mid-lesson.
 ///
-/// Applied as a FLOOR rather than a replacement: a session booked for longer
-/// than this keeps its own longer window. Abandoned rooms are still reclaimed,
-/// just at 180 + 30 minutes instead of 90.
-///
-/// Everything else in the live path already outlives this window and is
-/// deliberately left alone -- viewer JWT and publish nonce at 4h, the go-live
-/// window at 4h, Redis presence/poll/breakout at 6-24h. Short timeouts that
-/// govern retries, ICE gathering and health probes are unrelated to session
-/// lifetime and unchanged.
-pub const MIN_LIVE_SESSION_MINUTES: i64 = 180;
+/// Sized to outlast the things that legitimately interrupt a publisher without
+/// ending the class: a network blip, a laptop briefly sleeping, or a
+/// re-publish when the teacher switches camera or reloads the room.
+pub const PUBLISHER_GONE_GRACE_MINUTES: i64 = 15;
 
-/// Grace added on top of the effective duration before the auto-end sweep
-/// reclaims a still-`live` row. Exported so the join window can use the SAME
-/// deadline: a class the sweep is still willing to keep alive must remain
-/// joinable, or a teacher who runs long has students locked out of a room that
-/// is still publishing.
-pub const AUTO_END_GRACE_MINUTES: i64 = 30;
+/// A live session the sweep may need to act on, with the path to probe.
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct LiveSweepCandidate {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub main_path: Option<String>,
+    pub publisher_last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub actual_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
 
-/// Ends all `live` sessions whose
-/// `actual_started_at + max(duration_minutes, MIN_LIVE_SESSION_MINUTES) + AUTO_END_GRACE_MINUTES`
-/// is in the past. Returns `(id, tenant_id)` tuples for ended sessions, so
-/// callers can emit audit events.
-pub async fn sweep_auto_end(pool: &PgPool) -> sqlx::Result<Vec<(Uuid, Uuid)>> {
-    // Cross-tenant system sweep: elevate via app.system so the live_sessions RLS
-    // policies permit the UPDATE under the non-bypass aulalite_app role.
+/// Every session currently `live`, so the sweep can ask the media server which
+/// of them still has a publisher.
+pub async fn list_live_for_sweep(pool: &PgPool) -> sqlx::Result<Vec<LiveSweepCandidate>> {
+    // Cross-tenant system sweep: elevate via app.system so the live_sessions
+    // RLS policies permit the read under the non-bypass aulalite_app role.
     let mut tx = crate::db::begin_system_context(pool).await?;
-    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+    let rows = sqlx::query_as::<_, LiveSweepCandidate>(
+        "SELECT id, tenant_id, main_path, publisher_last_seen_at, actual_started_at
+           FROM live_sessions
+          WHERE status = 'live'",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Record that a publisher IS currently live on this session's path.
+///
+/// Called on every tick where the media server confirms the path is active, so
+/// the absence clock only ever measures a genuine, continuous disconnection.
+pub async fn mark_publisher_seen(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = crate::db::begin_system_context(pool).await?;
+    sqlx::query("UPDATE live_sessions SET publisher_last_seen_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Start the absence clock for a session observed with no publisher.
+///
+/// Seeded from `actual_started_at` so a session that went live but never
+/// successfully published is still reclaimed, rather than resetting its clock
+/// on every restart.
+pub async fn seed_publisher_absence(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = crate::db::begin_system_context(pool).await?;
+    sqlx::query(
+        "UPDATE live_sessions
+            SET publisher_last_seen_at = COALESCE(actual_started_at, now())
+          WHERE id = $1
+            AND publisher_last_seen_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// End one live session whose publisher has been confirmed gone.
+///
+/// Re-checks the absence window inside the statement so a publisher that came
+/// back between the probe and this write cannot be cut off, and so two
+/// overlapping sweeps cannot double-end a row.
+pub async fn end_if_publisher_gone(
+    pool: &PgPool,
+    id: Uuid,
+    grace_minutes: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = crate::db::begin_system_context(pool).await?;
+    let ended = sqlx::query(
         "UPDATE live_sessions
             SET status = 'ended',
                 actual_ended_at = now(),
                 publish_nonce = NULL,
                 publish_nonce_expires_at = NULL
-          WHERE status = 'live'
-            AND actual_started_at IS NOT NULL
-            AND actual_started_at
-                + (GREATEST(duration_minutes, $1) + $2) * interval '1 minute' < now()
-        RETURNING id, tenant_id",
+          WHERE id = $1
+            AND status = 'live'
+            AND publisher_last_seen_at IS NOT NULL
+            AND publisher_last_seen_at + ($2 * interval '1 minute') < now()",
     )
-    .bind(MIN_LIVE_SESSION_MINUTES as i32)
-    .bind(AUTO_END_GRACE_MINUTES as i32)
-    .fetch_all(&mut *tx)
-    .await?;
+    .bind(id)
+    .bind(grace_minutes as i32)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
     tx.commit().await?;
-    Ok(rows)
+    Ok(ended)
 }
 
 /// Joins `live_sessions` with `courses` to provide everything the join
@@ -412,6 +466,13 @@ pub struct ActiveSessionRow {
     pub starts_at: chrono::DateTime<chrono::Utc>,
     pub actual_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub transport_mode: String,
+    /// The MediaMTX path the teacher publishes to.
+    ///
+    /// Carried so callers can ask the media server whether a stream is ACTUALLY
+    /// flowing instead of inferring it from 'status = live', which is set the
+    /// instant the teacher presses Start -- before any WHIP attempt has been
+    /// made, and never cleared when that attempt fails.
+    pub main_path: Option<String>,
 }
 
 /// Convenience wrapper of `find_live_for_course` with RLS GUCs preset.
@@ -435,7 +496,7 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as::<_, ActiveSessionRow>(
-        "SELECT id, title, starts_at, actual_started_at, transport_mode
+        "SELECT id, title, starts_at, actual_started_at, transport_mode, main_path
            FROM live_sessions
           WHERE course_id = $1
             AND status = 'live'

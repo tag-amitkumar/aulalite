@@ -128,6 +128,18 @@ impl LiveRoomSession {
         &self.api
     }
 
+    /// Replace the viewer JWT this session hands to WHEP attaches.
+    ///
+    /// The token minted at join has a fixed TTL while a live class has NO
+    /// maximum duration, so in a long class it expires with the class still
+    /// running. Re-POSTing `/join` mints a fresh one (a running class answers
+    /// join with no upper bound); storing it here means every subsequent
+    /// re-attach starts from the current credential instead of the stale one
+    /// captured when the room mounted.
+    pub fn set_viewer_jwt(&mut self, viewer_jwt: String) {
+        self.config.viewer_jwt = Some(viewer_jwt);
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }

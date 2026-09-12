@@ -973,14 +973,57 @@ async fn mediamtx_auth_publish_rejects_wrong_password() {
 }
 
 #[tokio::test]
-async fn sweep_auto_end_ends_overdue_sessions() {
+async fn sweep_ends_a_session_whose_publisher_is_confirmed_gone() {
     let pool = pool().await;
     let tenant = create_tenant(&pool).await;
     let (teacher, _, _) = create_user(&pool).await;
     attach_membership(&pool, tenant, teacher, "teacher").await;
     let (_, session) = course_with_session(&pool, tenant, teacher, chrono::Utc::now()).await;
 
-    // Force the session overdue: started 4 hours ago, 60-min duration, well past 30-min grace.
+    // Publisher last seen well beyond the confirmation window. Note that
+    // `actual_started_at` is recent: the sweep must key off ABSENCE, not age.
+    sqlx::query(
+        "UPDATE live_sessions
+            SET status='live',
+                actual_started_at = now() - interval '5 minutes',
+                publisher_last_seen_at = now() - make_interval(mins => $2),
+                main_path = 'aula/x/y/z'
+          WHERE id=$1",
+    )
+    .bind(session)
+    .bind((backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES + 1) as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ended = backend::db::live_sessions::end_if_publisher_gone(
+        &pool,
+        session,
+        backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+    )
+    .await
+    .unwrap();
+    assert!(ended, "a publisher gone past the window must end the session");
+
+    let row: (String,) = sqlx::query_as("SELECT status FROM live_sessions WHERE id=$1")
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "ended");
+}
+
+#[tokio::test]
+async fn sweep_never_ends_a_long_running_class_whose_publisher_is_present() {
+    // The regression this whole change exists to prevent: a class far past any
+    // previous deadline (4 hours, booked for 60) whose teacher is still
+    // publishing must be left completely alone.
+    let pool = pool().await;
+    let tenant = create_tenant(&pool).await;
+    let (teacher, _, _) = create_user(&pool).await;
+    attach_membership(&pool, tenant, teacher, "teacher").await;
+    let (_, session) = course_with_session(&pool, tenant, teacher, chrono::Utc::now()).await;
+
     sqlx::query(
         "UPDATE live_sessions
             SET status='live',
@@ -993,21 +1036,31 @@ async fn sweep_auto_end_ends_overdue_sessions() {
     .await
     .unwrap();
 
-    let ended = backend::db::live_sessions::sweep_auto_end(&pool)
+    // The media server reports the publisher present on this tick.
+    backend::db::live_sessions::mark_publisher_seen(&pool, session)
         .await
         .unwrap();
-    assert!(ended.iter().any(|(id, _)| *id == session));
+
+    let ended = backend::db::live_sessions::end_if_publisher_gone(
+        &pool,
+        session,
+        backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+    )
+    .await
+    .unwrap();
+    assert!(!ended, "a publishing class must never be ended, at any age");
 
     let row: (String,) = sqlx::query_as("SELECT status FROM live_sessions WHERE id=$1")
         .bind(session)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(row.0, "ended");
+    assert_eq!(row.0, "live");
 }
 
 #[tokio::test]
-async fn sweep_auto_end_leaves_in_window_sessions_alone() {
+async fn sweep_leaves_a_recently_dropped_publisher_alone() {
+    // A blip inside the confirmation window is not a disconnection.
     let pool = pool().await;
     let tenant = create_tenant(&pool).await;
     let (teacher, _, _) = create_user(&pool).await;
@@ -1017,6 +1070,7 @@ async fn sweep_auto_end_leaves_in_window_sessions_alone() {
         "UPDATE live_sessions
             SET status='live',
                 actual_started_at = now() - interval '5 minutes',
+                publisher_last_seen_at = now() - interval '1 minute',
                 main_path = 'aula/x/y/z'
           WHERE id=$1",
     )
@@ -1025,10 +1079,78 @@ async fn sweep_auto_end_leaves_in_window_sessions_alone() {
     .await
     .unwrap();
 
-    let ended = backend::db::live_sessions::sweep_auto_end(&pool)
+    let ended = backend::db::live_sessions::end_if_publisher_gone(
+        &pool,
+        session,
+        backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+    )
+    .await
+    .unwrap();
+    assert!(!ended);
+}
+
+#[tokio::test]
+async fn seeding_absence_starts_the_clock_at_the_session_start() {
+    // A room that went live but never published must still be reclaimable:
+    // the clock is seeded from actual_started_at, not from now(), so it does
+    // not reset on every backend restart.
+    let pool = pool().await;
+    let tenant = create_tenant(&pool).await;
+    let (teacher, _, _) = create_user(&pool).await;
+    attach_membership(&pool, tenant, teacher, "teacher").await;
+    let (_, session) = course_with_session(&pool, tenant, teacher, chrono::Utc::now()).await;
+    sqlx::query(
+        "UPDATE live_sessions
+            SET status='live',
+                actual_started_at = now() - interval '4 hours',
+                publisher_last_seen_at = NULL,
+                main_path = NULL
+          WHERE id=$1",
+    )
+    .bind(session)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    backend::db::live_sessions::seed_publisher_absence(&pool, session)
         .await
         .unwrap();
-    assert!(ended.iter().all(|(id, _)| *id != session));
+
+    let ended = backend::db::live_sessions::end_if_publisher_gone(
+        &pool,
+        session,
+        backend::db::live_sessions::PUBLISHER_GONE_GRACE_MINUTES,
+    )
+    .await
+    .unwrap();
+    assert!(ended, "a room that never published must be reclaimed");
+}
+
+#[tokio::test]
+async fn the_sweep_lists_live_sessions_with_their_paths() {
+    let pool = pool().await;
+    let tenant = create_tenant(&pool).await;
+    let (teacher, _, _) = create_user(&pool).await;
+    attach_membership(&pool, tenant, teacher, "teacher").await;
+    let (_, session) = course_with_session(&pool, tenant, teacher, chrono::Utc::now()).await;
+    sqlx::query(
+        "UPDATE live_sessions
+            SET status='live', main_path = 'aula/x/y/z'
+          WHERE id=$1",
+    )
+    .bind(session)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows = backend::db::live_sessions::list_live_for_sweep(&pool)
+        .await
+        .unwrap();
+    let found = rows
+        .iter()
+        .find(|r| r.id == session)
+        .expect("live session must appear in the sweep listing");
+    assert_eq!(found.main_path.as_deref(), Some("aula/x/y/z"));
 }
 
 #[tokio::test]

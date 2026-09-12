@@ -495,12 +495,7 @@ mod imp {
         // teardown, including on the failure path just below.
         pc_guard.disarm();
 
-        if let Err(e) = crate::live_room_ice::await_connected(
-            &publisher.pc,
-            crate::live_room_ice::CONNECT_TIMEOUT_MS,
-        )
-        .await
-        {
+        if let Err(e) = crate::live_room_ice::await_connected(&publisher.pc).await {
             log_whip(&format!("publisher did NOT connect: {e}"));
             let _ = publisher.close().await;
             return Err(format!("WHIP publish did not connect: {e}"));

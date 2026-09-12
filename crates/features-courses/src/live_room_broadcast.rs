@@ -384,7 +384,7 @@ pub fn LiveRoomBroadcast(props: LiveRoomBroadcastProps) -> Element {
                     // failure, both of this effect's guards would be clear on
                     // the next render: it would re-acquire the camera, re-POST
                     // /go-live, leave another MediaMTX session to time out, and
-                    // burn another CONNECT_TIMEOUT_MS, forever, while the UI
+                    // re-negotiate from scratch, forever, while the UI
                     // still claimed to be Live and the only trace was this
                     // console line.
                     //

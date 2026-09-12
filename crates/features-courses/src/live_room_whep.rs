@@ -260,12 +260,7 @@ mod imp {
         // The viewer owns the connection from here.
         pc_guard.disarm();
 
-        if let Err(e) = crate::live_room_ice::await_connected(
-            &viewer.pc,
-            crate::live_room_ice::CONNECT_TIMEOUT_MS,
-        )
-        .await
-        {
+        if let Err(e) = crate::live_room_ice::await_connected(&viewer.pc).await {
             let _ = viewer.close().await;
             return Err(format!("WHEP subscribe did not connect: {e}"));
         }

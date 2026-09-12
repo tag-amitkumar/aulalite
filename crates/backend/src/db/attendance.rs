@@ -101,7 +101,7 @@ pub async fn record_leave(
 /// for the UPDATE — mirroring how the recording sweep scopes its tenant (it
 /// sets `app.tenant_id` per session it processes). This keeps the write correct
 /// even under the non-bypass `aulalite_app` role. The session lookup itself
-/// runs without a GUC, matching `live_sessions::sweep_auto_end` /
+/// runs without a GUC, matching `live_sessions::end_if_publisher_gone` /
 /// `list_ended_sessions_needing_recording`, which read `live_sessions` on a
 /// bare pool in their background tasks.
 pub async fn finalize_open_for_session(

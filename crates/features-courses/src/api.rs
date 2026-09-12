@@ -2080,6 +2080,14 @@ pub struct ActiveSessionInfoDto {
     pub title: String,
     pub starts_at: String,
     pub transport_mode: String,
+    /// Whether the teacher's stream is actually flowing on the media server.
+    /// Gates the student-facing "Live now" badge; see the backend
+    /// `ActiveSessionInfo::stream_ready`.
+    ///
+    /// Defaulted so a backend that predates the field cannot make the badge
+    /// appear: absent means "not confirmed live".
+    #[serde(default)]
+    pub stream_ready: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, PartialEq)]
